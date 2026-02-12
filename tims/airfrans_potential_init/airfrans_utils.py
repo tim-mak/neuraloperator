@@ -6,6 +6,8 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
 from torch.utils.data._utils.collate import default_collate
+
+
 class AirfransUtils:
 
     def __init__(self, *, model, data_processor, device):

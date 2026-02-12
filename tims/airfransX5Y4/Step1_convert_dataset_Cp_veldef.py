@@ -20,8 +20,6 @@ import numpy as np
 def process_airfrans_to_pt_archive(dataset_root, input_folder,archive_dir, training_dir ,xlen, ylen, xoffset, grid_size=(128, 128)):
     name = Path(input_folder).name
 
-
-
     simulation = af.Simulation(root=dataset_root, name=name)
 
     # 1. Extract Metadata from Name/Sim
@@ -38,6 +36,7 @@ def process_airfrans_to_pt_archive(dataset_root, input_folder,archive_dir, train
     reynolds = (v_mag_inf * 1.0 / nu_mol)  # assuming chord=1.0
     log_re = np.log10(reynolds)
     #print(f"Processing {name}: v_inf={v_inf}, aoa={aoa_deg}, nu_mol={nu_mol}, rho={rho}, log(Re)={log_re}")
+
     # 2. Grid Sampling
     mesh = simulation.internal
     xmin, xmax = (-xlen/2 + xoffset, xlen/2 + xoffset)
@@ -45,6 +44,7 @@ def process_airfrans_to_pt_archive(dataset_root, input_folder,archive_dir, train
 
     x_range = np.linspace(xmin, xmax, grid_size[0])
     y_range = np.linspace(ymin, ymax, grid_size[1])
+
     grid = pv.RectilinearGrid(x_range, y_range, np.array([mesh.center[2]]))
     sampled = grid.sample(mesh)
 
@@ -67,8 +67,6 @@ def process_airfrans_to_pt_archive(dataset_root, input_folder,archive_dir, train
     # Velocity Deficit
     u_ndef = (u_inf - u_raw) / v_mag_inf   
     v_ndef = (v_inf - v_raw) / v_mag_inf   
-
-
 
     # set velocity deficit to 1.0 inside the body (sdf < 0)
     u_ndef[mask == 1.0] = 1.0

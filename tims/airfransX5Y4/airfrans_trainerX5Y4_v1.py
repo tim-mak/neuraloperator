@@ -17,10 +17,14 @@ from torch import nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tims.airfransX5Y4 import airfrans_utils as utils
+from tims.airfransX5Y4.airfrans_datasetX5Y4_v1 import AirfoilEvaluator
+from tims.airfransX5Y4.airfrans_datasetX5Y4_v1 import AirfoilDataProcessor
+
 
 class AirfransTrainer(Trainer):
     
     def __init__(self, *, model, n_epochs, wandb_log = False, device = "cpu", mixed_precision = False, data_processor = None, eval_interval = 1, log_output = False, use_distributed = False, verbose = False):
+        self.evaluator = AirfoilEvaluator(processor=data_processor,device=device)
         self.utils = utils.AirfransUtils(model=model, data_processor=data_processor, device=device)
         super().__init__(model=model, n_epochs=n_epochs, wandb_log=wandb_log, device=device, mixed_precision=mixed_precision, data_processor=data_processor, eval_interval=eval_interval, log_output=log_output, use_distributed=use_distributed, verbose=verbose)
 
@@ -248,6 +252,8 @@ class AirfransTrainer(Trainer):
 
         if self.data_processor is not None:
             self.data_processor = self.data_processor.to(self.device)
+            # make sure data processor is in train mode  y = normalized for training loss
+            self.data_processor.train() 
             
             # Only save from the main process in DDP
             if not self.use_distributed or (dist.is_initialized() and dist.get_rank() == 0):
@@ -419,23 +425,23 @@ class AirfransTrainer(Trainer):
                         
                         # Get decoded physical values for plotting
                         y_decoded, _ = self.data_processor.postprocess(y_pred, tensor_sample)
-                        y_phys = y_decoded['y']
+                        y_phys = y_decoded
                         
                         
                         sample['props'] = current_props
 
 
                         # Run the CL predictions on a batch
-                        cl_preds = self.utils.evaluate_batch_metrics(sample)
+                       # cl_preds = self.utils.evaluate_batch_metrics(sample)
                         
                         # Plot the Cp distribution for the first airfoil in this batch
-                        clp_truth, clp_pred = self.utils.plot_surface_diagnostic(
-                            y_phys=y_phys, 
-                            batch=sample, 
-                            sample_idx=0,
-                            save_dir=self.save_dir
-                        )
-                        print(f" >> Sampled CL Predictions: Truth {clp_truth:.4f}  Predicted {clp_pred:.4f} ")
+                        #clp_truth, clp_pred = self.utils.plot_surface_diagnostic(
+                        #    y_phys=y_phys, 
+                        #    batch=sample, 
+                        #    sample_idx=0,
+                        #    save_dir=self.save_dir
+                        #)
+                        #print(f" >> Sampled CL Predictions: Truth {clp_truth:.4f}  Predicted {clp_pred:.4f} ")
 
                     
                     self.model.train() # Switch back to training mode
@@ -613,7 +619,7 @@ class AirfransTrainer(Trainer):
             if avg_lasso_loss is not None:
                 msg += f", avg_lasso={avg_lasso_loss:.4f}"
 
-            print(msg)
+            #print(msg)
             sys.stdout.flush()
 
             if self.wandb_log:
@@ -671,10 +677,12 @@ class AirfransTrainer(Trainer):
         with torch.no_grad():
             x_raw = batch['x'][sample_idx:sample_idx+1].to(self.device)
             y_raw = batch['y'][sample_idx:sample_idx+1].to(self.device)
-            # Convert to encoded space
+            # Convert to encoded space for x_raw in eval model y_raw returns decoded values
             sample = self.data_processor.preprocess({'x': x_raw, 'y': y_raw})
             x_input = sample['x'].to(self.device)
-            y_norm_truth = sample['y']
+            # need to get y in normalized space for plotting
+            y_norm_truth = self.data_processor.out_normalizer.transform(y_raw)
+            #y_norm_truth = sample['y']
             y_norm_pred = self.model(x_input)
 
             # Trainer uses normalized losses so calculate normalized residuals
