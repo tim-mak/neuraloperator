@@ -37,7 +37,7 @@ class CSTAirfoil:
         self.params_upper = best_upper_params
         self.params_lower = best_lower_params
 
-    def resample_airfoil(self,x, y, n_points=100):
+    def resample_airfoil(self,x, y, n_points=101):
         """Clean and resample airfoil coordinates using cosine spacing."""
         # 1. Normalize
         x = (x - x.min()) / (x.max() - x.min())
@@ -257,21 +257,157 @@ class CSTAirfoil:
         coords = np.column_stack([x_combined, y_combined])
         return coords
     
-    def get_resampled_coords(self,x_query, le_idx):
+    def get_resampled_spline_coords(self,x_query, le_idx):
 
         x_min = x_query[le_idx]
         x_max = x_query[np.argmax(x_query)]  
 
         x_upper = x_query[:le_idx]
         x_lower = x_query[le_idx:]
-        
+        print (f" Check LE position: {x_query[le_idx]}, Check TE position: {x_query[np.argmax(x_query)]}")
+      
         y_fit_upper = self.get_upper_coords_at(x_upper, x_min, x_max)
         y_fit_lower = self.get_lower_coords_at(x_lower, x_min, x_max)
 
-        return y_fit_upper, y_fit_lower
-
-
+        return x_upper, y_fit_upper, x_lower, y_fit_lower
     
+
+
+    def create_splinerep(self, x_te =2.0, x_le =-2.0):
+       
+        coords = self.get_coords_sellig_format()
+
+        target_span = x_te - x_le
+
+        coord_te = np.max(coords[:, 0]) 
+        coord_le = np.min(coords[:, 0])
+        coord_span = coord_te- coord_le
+
+        scale = target_span / coord_span
+        offset = x_te - coord_te
+        print(f" Coords shape: {coords.shape}, Sample Coords: {coords.dtype}")
+        print(f" Coords min x: {coord_le}, max x: {coord_te}")
+        print(f" Scale: {scale}, Offset: {offset}"  )
+
+        x = (coords[:, 0] ) * scale - x_te
+        y = coords[:, 1]*scale
+
+        print(f" After scaling, Coords min x: {np.min(x)}, max x: {np.max(x)}")
+        self.b_spline = splprep([x,y], k=3, s=0, per=True)
+
+        return self.b_spline
+    
+    def eval_spline_at_t(self, t):
+        """Evaluate the spline representation at given parameter t."""
+        if not hasattr(self, 'b_spline'):
+            raise ValueError("Spline representation not created. Call create_splinerep() first.")
+        
+        x_eval, y_eval = splev(t, self.b_spline[0])
+        return x_eval, y_eval
+    
+    def eval_spline_normal_at_t(self, t):
+        """Evaluate the normal vectors of the spline at given parameter t."""
+        if not hasattr(self, 'b_spline'):
+            raise ValueError("Spline representation not created. Call create_splinerep() first.")
+        
+        dx, dy = splev(t, self.b_spline[0], der=1)
+        tangents = np.column_stack([dx, dy])
+        norms = np.linalg.norm(tangents, axis=1, keepdims=True)
+        normals = np.column_stack([-dy / norms[:, 0], dx / norms[:, 0]])  # Rotate tangent by 90 degrees
+        return normals
+    
+    def find_t_closest_xy(self, x, y, t_min, t_max):
+        """
+        Finds the B-spline parameter t that matches the 
+        K-T theoretical nose (z_nose).
+        """
+        # Objective: Minimize the Euclidean distance between 
+        # the B-spline point P(t) and the K-T nose (x_le_kt, y_le_kt)
+        if not hasattr(self, 'b_spline'):
+            raise ValueError("Spline representation not created. Call create_splinerep() first.")
+               
+        def objective(t):
+            px, py = splev(t, self.b_spline[0])
+            return np.sqrt((px - x)**2 + (py - y)**2)
+
+        # Search in the middle of the loop (t ~ 0.5)
+        res = minimize_scalar(objective, bounds=(t_min, t_max), method='bounded')
+        print(f"Closest point on spline to ({x:.4f}, {y:.4f}) is at t={res.x:.4f} with distance {res.fun:.2e}")
+        return res.x
+    
+    def snap_kt_to_bspline(self, kt_points,  t_init=0.0, t_delta=0.02, t_min=0, t_max=1.0):
+        """
+        Snaps K-T guide points to the B-spline along their normals.
+        """
+        snapped_points = []
+        t_values = []
+
+        t_guess = t_init  # Start with the first point's initial guess
+
+        for i in range(len(kt_points)):
+            # Objective: Find t that minimizes distance between B-spline P(t) 
+            t_low = max(t_min, t_guess - t_delta)
+            t_high = min(t_max, t_guess + t_delta)
+            
+            t_sol = self.find_t_closest_xy(kt_points[i].real, kt_points[i].imag, t_low, t_high)
+            
+            # Evaluate the spline at the found t
+            px, py = splev(t_sol, self.b_spline[0])
+            snapped_points.append(complex(px, py))
+            t_values.append(t_sol)
+            
+            # Update guess for next point (points are ordered)
+            t_guess = t_sol
+        
+        return np.array(snapped_points), t_values
+
+    def snap_kt_to_bspline_along_normal(self, kt_points, kt_normals, t_init=0.0, t_delta=0.02, t_min=0, t_max=1.0):
+        """
+        Snaps K-T guide points to the B-spline by finding the intersection
+        of the K-T normal ray and the B-spline curve.
+        """
+        snapped_points = []
+        t_values = []
+        # Start the search near the previous t to speed up convergence
+        if isinstance(t_init, list) or isinstance(t_init, np.ndarray):
+            # if a list of initial t values is provided, use them for each point
+            t_guess = t_init  # Start with the first point's initial guess
+        else:
+            # If a single value is provided, use it for all points
+            t_guess = np.ones_like(kt_points) * t_init  
+        
+        for i in range(len(kt_points)):
+            p_kt = kt_points[i]
+            n_kt = kt_normals[i] # Expecting [nx, ny]
+
+            # Define the objective: Minimize the perpendicular distance 
+            # from the spline point P(t) to the ray (p_kt + alpha * n_kt)
+            def objective(t):
+                px, py = splev(t, self.b_spline[0])
+                # 2D Cross product magnitude: |(P - P_kt) x n_kt|
+                dist_to_ray = abs((px - p_kt.real) * n_kt[1] - (py - p_kt.imag) * n_kt[0])
+                
+                # Add a small penalty for Euclidean distance to ensure we pick 
+                # the intersection closest to the airfoil, not one on the far side
+                euclidean_dist = np.sqrt((px - p_kt.real)**2 + (py - p_kt.imag)**2)
+                return dist_to_ray + 0.01 * euclidean_dist
+
+            # Local window search to maintain ordering and surface integrity
+            t_low = max(t_min, t_guess[i] - t_delta)
+            t_high = min(t_max, t_guess[i] + t_delta)
+            
+            # Use a more robust optimizer if brentq/minimize_scalar struggles
+            res = minimize_scalar(objective, bounds=(t_low, t_high), method='bounded')
+            
+            t_sol = res.x
+            px, py = splev(t_sol, self.b_spline[0])
+            
+            snapped_points.append(complex(px, py))
+            t_values.append(t_sol)
+            
+            
+        return np.array(snapped_points), t_values
+
     def get_upper_coords_at(self, x_query, x_min, x_max):
         """Get upper surface y-coordinates at specified x-coordinates."""
 
