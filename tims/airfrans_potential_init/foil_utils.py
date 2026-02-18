@@ -278,6 +278,7 @@ class CSTAirfoil:
         coords = self.get_coords_sellig_format()
 
         target_span = x_te - x_le
+        print(f" Target span: {target_span}, TE: {x_te}, LE: {x_le}")
 
         coord_te = np.max(coords[:, 0]) 
         coord_le = np.min(coords[:, 0])
@@ -289,7 +290,7 @@ class CSTAirfoil:
         print(f" Coords min x: {coord_le}, max x: {coord_te}")
         print(f" Scale: {scale}, Offset: {offset}"  )
 
-        x = (coords[:, 0] ) * scale - x_te
+        x = (coords[:, 0] - coord_te) * scale + x_te
         y = coords[:, 1]*scale
 
         print(f" After scaling, Coords min x: {np.min(x)}, max x: {np.max(x)}")
@@ -332,7 +333,7 @@ class CSTAirfoil:
 
         # Search in the middle of the loop (t ~ 0.5)
         res = minimize_scalar(objective, bounds=(t_min, t_max), method='bounded')
-        print(f"Closest point on spline to ({x:.4f}, {y:.4f}) is at t={res.x:.4f} with distance {res.fun:.2e}")
+        #print(f"Closest point on spline to ({x:.4f}, {y:.4f}) is at t={res.x:.4f} with distance {res.fun:.2e}")
         return res.x
     
     def snap_kt_to_bspline(self, kt_points,  t_init=0.0, t_delta=0.02, t_min=0, t_max=1.0):

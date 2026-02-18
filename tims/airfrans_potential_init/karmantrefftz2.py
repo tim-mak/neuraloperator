@@ -1,3 +1,4 @@
+from matplotlib.pylab import gamma
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -170,6 +171,19 @@ class KarmanTrefftzAirfoil:
         ax2.legend()
         plt.show()
     
+    def calculate_chord_length(self, z_raw):
+            # 2. Find the raw K-T span
+            kt_min_x, kt_max_x = np.min(z_raw.real), np.max(z_raw.real)
+            kt_raw_chord = kt_max_x - kt_min_x
+            
+            return kt_raw_chord,kt_min_x,kt_max_x
+    def set_fitted_scale(self, scale):
+        self.fitted_scale = scale
+
+    def set_fitted_chord(self, chord):
+        self.fitted_chord = chord
+    def set_fitted_te(self, te):
+        self.fitted_te = te
 
     def find_best_fit(self, x_foil, y_foil, num_points=101):
         """Find the best fit Karman-Trefftz parameters for the given airfoil coordinates"""
@@ -181,22 +195,32 @@ class KarmanTrefftzAirfoil:
             self.set_params(mux, muy, tau_deg)
             zeta = self.generate_circle_points( num_points)
 
-            z = self.apply_kalman_transform(zeta)
+            z_raw = self.apply_kalman_transform(zeta)
+
+            #calculate chord length and scale to match the original airfoil chord
+            kt_raw_chord, kt_min_x, kt_max_x = self.calculate_chord_length(z_raw)
+
+            # 3. Calculate Target Chord
+            target_min_x, target_max_x = np.min(x_foil), np.max(x_foil)
+            target_chord = target_max_x - target_min_x
+            
+            # 4. SCALE THE K-T FOIL TO MATCH TARGET CHORD
+            # This removes chord length as a variable the optimizer has to "find"
+            scale_to_target = target_chord / kt_raw_chord
+            z_final = (z_raw - kt_max_x) * scale_to_target + target_max_x
+            print(f" Scaling K-T foil by {scale_to_target:.4f} to match target chord length {target_chord:.4f}")
             # Interpolate z to the x_foil points and compute distance
+            self.set_fitted_scale(scale_to_target)
+            self.set_fitted_chord(kt_raw_chord*scale_to_target)
+            self.set_fitted_te(kt_max_x)
 
             # get interpolated points on the airfoil for upper and lower surface
-            z_upper = z[zeta.imag >= 0]
-            z_lower = z[zeta.imag < 0]
+            z_upper = z_final[zeta.imag >= 0]
+            z_lower = z_final[zeta.imag < 0]
 
             le_index = np.argmin(x_foil)
             y_upper = y_foil[:le_index]
             y_lower = y_foil[le_index:]
-
-            #print(f" ")
-            #print(f" z_upper values: {z_upper[:5]} ... {z_upper[:-5]}")
-            #print(f" All")
-            #print(f" z_upper values: min {min(z_upper.imag)} ... max {max(z_upper.imag)} ")
-            #print(f" z_lower values: min {min(z_lower.imag)} ... max {max(z_lower.imag)} ")
 
             # Need to sort upper surface point so that x is ascending
             x_foil_upper_sorted_indices = np.argsort(x_foil[:le_index])
@@ -205,12 +229,6 @@ class KarmanTrefftzAirfoil:
             z_upper_interp = np.interp(x_foil[x_foil_upper_sorted_indices], z_upper.real[z_upper_sorted_indices], z_upper.imag[z_upper_sorted_indices])
             z_upper_interp = np.flip(z_upper_interp)  # Flip to match the order of y_upper
             z_lower_interp = np.interp(x_foil[le_index:], z_lower.real, z_lower.imag)
-            
-            #print(f" x_upper values: {x_foil[:5]} ... {x_foil[-5:]}")
-
-            #print(f" z_upper_interp  values: min {min(z_upper_interp)} ... max {max(z_upper_interp)}")
-            #print(f" z_lower_interp  values: min {min(z_lower_interp)} ... max {max(z_lower_interp)}")
-
 
             y_dist_upper = np.sqrt((z_upper_interp - y_upper)**2 )
             y_dist_lower = np.sqrt((z_lower_interp - y_lower)**2 )
@@ -234,7 +252,7 @@ class KarmanTrefftzAirfoil:
                 plt.show()
                      
 
-            print("Testing params: mux={:.4f}, muy={:.4f}, tau={:.2f}°, y_dist_mean ={:.2f}".format(mux, muy, tau_deg, y_dist_mean))
+            print(f"Testing params: mux={mux:.4f}, muy={muy:.4f}, tau={tau_deg:.2f}°, y_dist_mean={y_dist_mean:.2f}, scale to target={scale_to_target:.4f}, kt_raw_chord={kt_raw_chord:.4f}, target_chord={target_chord:.4f}")
             return y_dist_mean
         
         tau_deg = 10.0  # Initial guess for trailing edge angle
@@ -251,27 +269,30 @@ class KarmanTrefftzAirfoil:
         self.set_params(best_mux, best_muy, best_tau_deg)
         return best_mux, best_muy, best_tau_deg
     
-    def generate_circle_grid(self, n_radial=50,n_theta=50, far_field_radius=5.0):
+    def generate_circle_grid(self,  n_radial=50 , n_theta=50, far_field_radius=5.0):
         """Generate a grid in the zeta-plane that can be transformed to the physical plane"""
-        theta = np.linspace(0, 2 * np.pi, n_theta, endpoint=True)
 
         # Inner radius is R to ensure we are outside the singularity at the center of the circle in the zeta-plane
         r_min = self.R 
 
+        # get TE and LE theta for the circle grid
+        theta_te = self.get_trailing_edge_theta()
+
         r = np.linspace(r_min, far_field_radius, n_radial)  
+        theta = np.linspace(theta_te, theta_te + 2*np.pi, n_theta, endpoint=True)
+        theta = np.unwrap(theta)  # Unwrap to ensure continuity
+
         R, Theta = np.meshgrid(r, theta)
         zeta = R * np.exp(1j * Theta) + complex(self.mux, self.muy)  # Shift to center at (mux, muy)
         return zeta
     
-    def generate_conformal_grid(self, n_radial=50, n_theta=50, far_field_radius=5.0):
+    def generate_conformal_grid(self,  n_radial=50, n_theta=50, far_field_radius=5.0):
         """Generate a conformal grid in the zeta-plane that can be transformed to the physical plane"""
+        
+        
         # Generate points on the airfoil surface (zeta-plane)
         zeta_surface = self.generate_circle_grid(n_radial=n_radial, n_theta=n_theta, far_field_radius=far_field_radius)
         
-        # Generate points in the far-field (circular grid in zeta-plane)
-        theta = np.linspace(0, 2 * np.pi, n_theta, endpoint=False)
-
-
         # Apply Karman-Trefftz transformation to get physical coordinates
         z_grid = self.apply_kalman_transform(zeta_surface)
 
@@ -285,14 +306,121 @@ class KarmanTrefftzAirfoil:
         plotter.add_mesh(grid, color="lightblue", show_edges=True)
         plotter.view_xy()
         plotter.show()  
+    
+    def pyvista_overlay_mesh(self, zeta1, zeta2):
+        """Create a PyVista mesh from the given coordinates"""
 
+        grid1 = pv.StructuredGrid(zeta1.real, zeta1.imag, np.zeros_like(zeta1.real))
+        grid2 = pv.StructuredGrid(zeta2.real, zeta2.imag, np.zeros_like(zeta2.real))
+        plotter = pv.Plotter()
+        plotter.add_mesh(grid1, style='wireframe', color="blue", opacity=1.0,line_width=2)
+        plotter.add_mesh(grid2, style='wireframe', color="red", opacity=1.0, line_width=2)
+        plotter.view_xy()
+        plotter.show()  
+
+    def compute_source_terms(self, X, Y):
+        """
+        Computes the P and Q source terms from an initial K-T grid using second-order central differences.
+        Assumes X, Y are shape (N_xi, N_eta).
+        """
+        # 1st derivatives
+        X_xi = 0.5 * (X[2:, 1:-1] - X[:-2, 1:-1])
+        X_eta = 0.5 * (X[1:-1, 2:] - X[1:-1, :-2])
+        Y_xi = 0.5 * (Y[2:, 1:-1] - Y[:-2, 1:-1])
+        Y_eta = 0.5 * (Y[1:-1, 2:] - Y[1:-1, :-2])
+
+        # 2nd derivatives
+        X_xixi = X[2:, 1:-1] - 2*X[1:-1, 1:-1] + X[:-2, 1:-1]
+        Y_xixi = Y[2:, 1:-1] - 2*Y[1:-1, 1:-1] + Y[:-2, 1:-1]
+
+        X_etaeta = X[1:-1, 2:] - 2*X[1:-1, 1:-1] + X[1:-1, :-2]
+        Y_etaeta = Y[1:-1, 2:] - 2*Y[1:-1, 1:-1] + Y[1:-1, :-2]
+
+        # Source terms (Hilgenstock / Thomas-Middlecoff formulation)
+        # 1e-10 prevents division by zero in highly orthogonal regions
+        P = -(X_xi * X_xixi + Y_xi * Y_xixi) / (X_xi**2 + Y_xi**2 + 1e-10)
+        Q = -(X_eta * X_etaeta + Y_eta * Y_etaeta) / (X_eta**2 + Y_eta**2 + 1e-10)
+        print(f"Computed source terms P and Q with shapes {P.shape} and {Q.shape}")
+
+        return P, Q
+    
+    def smooth_elliptic_grid(self, X, Y, P, Q, iterations=50):
+        """
+         Relaxes internal grid points using Poisson equations to preserve spacing.
+        Assumes shape (N_xi, N_eta) where:
+        X[:, 0] is the airfoil surface
+        X[:, -1] is the far-field boundary
+        X[0, :] and X[-1, :] meet at the trailing edge wake cut
+        P and Q are the source terms computed from the initial K-T grid, shape (N_xi-2, N_eta-2) for internal points.
+        """
+
+        for it in range(iterations):
+            X_old = X.copy()
+            Y_old = Y.copy()
+            
+            # 1. First Derivatives
+            X_xi = 0.5 * (X[2:, 1:-1] - X[:-2, 1:-1])
+            X_eta = 0.5 * (X[1:-1, 2:] - X[1:-1, :-2])
+            Y_xi = 0.5 * (Y[2:, 1:-1] - Y[:-2, 1:-1])
+            Y_eta = 0.5 * (Y[1:-1, 2:] - Y[1:-1, :-2])
+            
+            # 2. Metric coefficients
+            alpha = X_eta**2 + Y_eta**2
+            beta = X_xi * X_eta + Y_xi * Y_eta
+            gamma = X_xi**2 + Y_xi**2
+            
+            # 3. Cross derivatives
+            X_xiet = 0.25 * (X[2:, 2:] - X[2:, :-2] - X[:-2, 2:] + X[:-2, :-2])
+            Y_xiet = 0.25 * (Y[2:, 2:] - Y[2:, :-2] - Y[:-2, 2:] + Y[:-2, :-2])
+            # 2. UPDATE ONLY FROM j=2 ONWARD
+            # 4. Poisson Update (Notice the addition of P * X_xi and Q * X_eta)
+            X[1:-1, 2:-1] = (alpha[:, 1:] * (X[2:, 2:-1] + X[:-2, 2:-1] + P[:, 1:] * X_xi[:, 1:]) - 
+                         2 * beta[:, 1:] * X_xiet[:, 1:] + 
+                         gamma[:, 1:] * (X[1:-1, 3:] + X[1:-1, 1:-2] + Q[:, 1:] * X_eta[:, 1:])) / (2 * (alpha[:, 1:] + gamma[:, 1:]))
+                         
+            Y[1:-1, 2:-1] = (alpha[:, 1:] * (Y[2:, 2:-1] + Y[:-2, 2:-1] + P[:, 1:] * Y_xi[:, 1:]) - 
+                         2 * beta[:, 1:] * Y_xiet[:, 1:] + 
+                         gamma[:, 1:] * (Y[1:-1, 3:] + Y[1:-1, 1:-2] + Q[:, 1:] * Y_eta[:, 1:])) / (2 * (alpha[:, 1:] + gamma[:, 1:]))
+            
+            # 5. Handle the Periodic Wake Cut
+            X[0, 1:-1] = X[-1, 1:-1] = 0.5 * (X[1, 1:-1] + X[-2, 1:-1])
+            Y[0, 1:-1] = Y[-1, 1:-1] = 0.5 * (Y[1, 1:-1] + Y[-2, 1:-1])
+            
+        return X, Y
+
+
+    def algebraic_grid_blend(self, zeta_kt, z_cst_snap, decay_power=2.0):
+        """
+        Blends the snapped wall deformation into the interior K-T grid algebraically.
+        zeta_kt: The original, perfect analytical K-T grid (complex array, shape N_xi, N_eta)
+        z_cst_snap: The snapped surface coordinates (complex array, shape N_xi)
+        """
+        N_xi, N_eta = zeta_kt.shape
+        zeta_new = zeta_kt.copy()
+        
+        # 1. Calculate the exact deformation vector at the wall (j=0)
+        # This is the difference between your new CST boundary and the old K-T boundary
+        wall_deformation = z_cst_snap - zeta_kt[:, 0]
+        
+        # 2. Create a decay curve from 1.0 (at the wall) to 0.0 (at the farfield)
+        # j_indices runs from 0 to N_eta - 1
+        j_indices = np.arange(N_eta)
+        
+        # decay_power controls how fast the deformation vanishes. 
+        # 1.0 = linear decay. 2.0 or 3.0 = deformation mostly stays near the foil.
+        decay = (1.0 - j_indices / (N_eta - 1)) ** decay_power
+        
+        # 3. Apply the decaying deformation to every point in the grid
+        # Reshaping decay to (1, N_eta) allows NumPy to broadcast it across all xi angles
+        zeta_new = zeta_kt + wall_deformation[:, np.newaxis] * decay[np.newaxis, :]
+        
+        return zeta_new
 
 
 
 def plot_geometry_comparison(x_foil, y_foil, x2_foil, y2_foil):
 
     """Plot the original airfoil coordinates and the best fit Karman-Trefftz airfoil for comparison"""
-
 
     plt.figure(figsize=(20, 16))
     plt.plot(x_foil, y_foil, 'ro-', label='Original Airfoil', markersize=4)
@@ -304,9 +432,6 @@ def plot_geometry_comparison(x_foil, y_foil, x2_foil, y2_foil):
     plt.grid()
     plt.legend()
     plt.show()
-
-    
-
 
 def convert(dataset_root, output_folder, xlen, ylen, xoffset, grid_size):
 
@@ -331,8 +456,11 @@ def convert(dataset_root, output_folder, xlen, ylen, xoffset, grid_size):
         aoa_rad = np.deg2rad(aoa_deg)
         foil = simulation.airfoil
 
+
+        points_on_foil = 101
+
         # Fit CST airfoil to get smooth coordinates and handle any issues with the original points
-        cst_airfoil = CSTAirfoil(foil.points[:, 0], foil.points[:, 1], n_points= 101, n_order=14)
+        cst_airfoil = CSTAirfoil(foil.points[:, 0], foil.points[:, 1], n_points= points_on_foil, n_order=14)
         cst_airfoil.plot_fit()
         coords = cst_airfoil.get_coords_sellig_format()
 
@@ -358,7 +486,7 @@ def convert(dataset_root, output_folder, xlen, ylen, xoffset, grid_size):
         print(f"x_offset: {x_offset:.6f}")
 
       
-        scale = 4.0 / (x_te - x_le)  # Scale to ensure the transformed airfoil has a chord length of 2
+        scale = 4.0 / (x_te - x_le)  # Initial Scale to ensure the transformed airfoil has a chord length of 2
 
         x_foil = x_foil * scale
         y_foil = y_foil * scale
@@ -368,25 +496,41 @@ def convert(dataset_root, output_folder, xlen, ylen, xoffset, grid_size):
 
         kt_foil = KarmanTrefftzAirfoil(mux=-0.08, muy=0.08, tau_deg=10.0)
 
-        n_points =101
 
-        best_mux, best_muy, best_tau_deg = kt_foil.find_best_fit(x_foil, y_foil, num_points=n_points)
-        print(f"Best fit Karman-Trefftz parameters for {name}: mux={best_mux:.4f}, muy={best_muy:.4f}, tau={best_tau_deg:.2f}°")
+        best_mux, best_muy, best_tau_deg = kt_foil.find_best_fit(x_foil, y_foil, num_points=points_on_foil)
+        print(f"Best fit Karman-Trefftz parameters for {name}: mux={best_mux:.4f}, muy={best_muy:.4f}, tau={best_tau_deg:.2f}° ")
+
+        scale_to_target = kt_foil.fitted_scale # Example value, replace with actual target scale if needed
+        te_kt = kt_foil.fitted_te
+
+        # adjust x_foil and y_foil to match the scale and TE position of the best fit K-T foil
+        z_kt_foil = kt_foil.apply_kalman_transform(kt_foil.generate_circle_points(num_points=points_on_foil))
+        x_kt_foil = z_kt_foil.real
+        y_kt_foil = z_kt_foil.imag
+
+
+        kt_chord = ( np.max(x_kt_foil) - np.min(x_kt_foil) )
+        target_chord = np.max(x_foil) - np.min(x_foil)
+        scale_to_kt = kt_chord / target_chord
+
+        te_kt = np.max(x_kt_foil)  # TE position of the K-T foil after scaling
+        te_target = np.max(x_foil)  # TE position of the original foil after scaling    
+        #update x_foil to match the scale and TE position of the best fit K-T foil
+        x_foil = (x_foil - te_target) * scale_to_kt  + te_kt  # 
+
+        print(f" K-T fitted chord: {kt_chord:.4f}, Target chord: {target_chord:.4f},  Delta chord {kt_chord - target_chord:.4f}  Scale to target: {scale_to_target:.4f} ")
         
-        z = kt_foil.apply_kalman_transform(kt_foil.generate_circle_points(num_points=n_points))
         
-        
-        x_kt_foil = z.real
-        y_kt_foil = z.imag
+
 
         plot_geometry_comparison(x_foil, y_foil, x_kt_foil, y_kt_foil)
 
-        zeta_g = kt_foil.generate_conformal_grid(n_radial=50, n_theta=n_points, far_field_radius=5.0)
+        zeta_g = kt_foil.generate_conformal_grid(n_radial=50, n_theta=points_on_foil, far_field_radius=5.0)
 
     
         kt_foil.pyvista_mesh(zeta_g)
 
-        fit_points = 51
+        fit_points = 101
 
         # Theta TE 
 
@@ -403,109 +547,60 @@ def convert(dataset_root, output_folder, xlen, ylen, xoffset, grid_size):
         z_le = kt_foil.apply_kalman_transform(kt_foil.generate_circle_points_at_theta(theta_le))
         print(f" Z LE {z_le}")
 
-        # Alternative definition + pi from TE
-        theta_upper = np.linspace(0, np.pi, fit_points, endpoint= True)
-        theta_upper = theta_upper + theta_te
-        theta_upper = np.unwrap(theta_upper)  # Unwrap to ensure continuity      
 
-        # Definition E from Blom report
-        # z_le_alt = (z_le)       
-        theta_upper = np.linspace(theta_te, theta_le, fit_points, endpoint= True)
+        # Angles theta from TE back to TE for complete surface
+        theta = np.linspace(theta_te, theta_te + 2*np.pi, fit_points, endpoint= True)
         #theta_upper = theta_upper + theta_te
-        theta_upper = np.unwrap(theta_upper)  # Unwrap to ensure continuity      
+        theta = np.unwrap(theta)  # Unwrap to ensure continuity      
 
         #theta_upper_le = theta_upper[-1]
         #print(f" Theta upper LE {theta_upper_le} expecting around {theta_le} rad or 180 deg ")
         #theta_upper = (theta_upper + 2*np.pi) % (2 * np.pi) - np.pi
 
-        print(f" Range of theta for upper from {(theta_upper[0])}  to {(theta_upper[-1])}")
-        z_upper = kt_foil.apply_kalman_transform(kt_foil.generate_circle_points_at_theta(theta_upper))
-        print(f" Leading edge point from upper surface: {z_upper[-1]} Trailing edge point from upper surface: {z_upper[0]}")
-        z_le_alt = (z_upper[-1])
-
-
-
-        print(f" Z-plane LE from upper surface: ({z_le_alt.real:.6f}, {z_le_alt.imag:.6f})")       
+        print(f" Range of theta from {(theta[0])}  to {(theta[-1])}")
+        z_kt_foil = kt_foil.apply_kalman_transform(kt_foil.generate_circle_points_at_theta(theta))
         
+        # Create B-spline representation of the CST airfoil for snapping
         print(f" KT singularity point k  in z-plane: {(kt_foil.k )}")
-        cst_airfoil.create_splinerep( x_te= kt_foil.k, x_le= -kt_foil.k)
-        # test spline eval
-        eval_x, eval_y = cst_airfoil.eval_spline_at_t(0.5055)
-        print(f" Spline eval at t=0.5: ({eval_x:.6f}, {eval_y:.6f})")
 
-        t_le = cst_airfoil.find_t_closest_xy(z_le_alt.real, z_le_alt.imag, t_min=0.4, t_max=0.6)
+        x_te = np.max(z_kt_foil.real ) # TE point from K-T foil
+        x_le  = np.min(z_kt_foil.real)  # LE point from K-T foil
 
-        x_le,y_le = cst_airfoil.eval_spline_at_t(t_le)
-        print(f" Closest point on CST to LE: ({x_le:.6f}, {y_le:.6f}) at t={t_le:.4f}")
+        cst_airfoil.create_splinerep( x_te= x_te, x_le= x_le)
+
 
         # Get t-values of points closest to the upper surface of the K-T foil to initialize snapping
-        _,t_upper_init = cst_airfoil.snap_kt_to_bspline(z_upper,  t_init=0.0,t_delta=0.05)
+        _,t_init = cst_airfoil.snap_kt_to_bspline(z_kt_foil,  t_init=0.0,t_delta=0.05)
 
         # Calculate normals for the upper surface of the K-T foil from angles theta in zeta plane
-        kt_normal_upper = kt_foil.get_kt_normals(theta_upper)
+        kt_normals = kt_foil.get_kt_normals(theta)
         # Get points on the CST surface closest to the upper surface of the K-T foil by snapping along the normals of K-T foil
-        kt_closest_upper, t_upper = cst_airfoil.snap_kt_to_bspline_along_normal(z_upper, kt_normal_upper, t_init=t_upper_init, t_delta=0.05)
-
-
-        print(f" T-dist TE: {t_upper} expecting around 0.0 to {t_le} ")
+        # dont snap the first and last point to avoid issues with the trailing edge singularity and the leading edge point
         
-        theta_lower = np.linspace(theta_le, 2*np.pi + theta_te, fit_points, endpoint= True)
-        #theta_lower = theta_lower + theta_te 
-        theta_lower = np.unwrap(theta_lower)  # Unwrap to ensure continuity
-
-        # coordinates of k-t foil for lower surface [180-360]
-        z_lower = kt_foil.apply_kalman_transform(kt_foil.generate_circle_points_at_theta(theta_lower))
-        _,t_lower_init = cst_airfoil.snap_kt_to_bspline(z_lower,  t_init=t_le,t_delta=0.05, t_min=t_le, t_max=1.0)
-
-        kt_normal_lower = kt_foil.get_kt_normals(theta_lower)
-        kt_closest_lower, t_lower = cst_airfoil.snap_kt_to_bspline_along_normal(z_lower, kt_normal_lower, t_init=t_lower_init,t_delta=0.05)
-
+        z_cst_snap = z_kt_foil.copy()
+        t_snap = np.zeros_like(t_init)
+        z_cst_snap[1:-1], t_snap[1:-1] = cst_airfoil.snap_kt_to_bspline_along_normal(z_kt_foil[1:-1], kt_normals[1:-1], t_init=t_init[1:-1], t_delta=1/fit_points, t_min=0.0, t_max=1.0)
         
+        #x_cst_target, y_cst_target = cst_airfoil.eval_spline_at_t(np.linspace(0,1.0, fit_points, endpoint= True))
 
-        #le_idx = np.argmin(x_kt_foil)
-
-        x_kt_foil_upper = z_upper.real
-        x_kt_foil_lower = z_lower.real
-
-        y_kt_foil_upper = z_upper.imag
-        y_kt_foil_lower = z_lower.imag
-
-        x_kt_foil_upper_min = np.min(x_kt_foil_upper)
-        x_kt_foil_upper_max = np.max(x_kt_foil_upper)
-        x_kt_foil_lower_min = np.min(x_kt_foil_lower)
-        x_kt_foil_lower_max = np.max(x_kt_foil_lower)
-
-
-
-        x_upper_target, y_upper_target = cst_airfoil.eval_spline_at_t(np.linspace(0,t_le, fit_points, endpoint= True))
-        x_lower_target, y_lower_target = cst_airfoil.eval_spline_at_t(np.linspace(t_le, 1, fit_points, endpoint= True))
-
-        print(f"Upper Shape of x_upper: {x_kt_foil_upper.shape}, Upper Shape of y_upper_target: {y_upper_target.shape}")
-        print(f"Upper Shape of y_upper_target: {y_upper_target.shape}, Lower Shape of y_lower_target: {y_lower_target.shape}")
+        print(f"Upper Shape of x_upper: {z_kt_foil.real.shape}, Upper Shape of y_upper_target: {z_kt_foil.imag.shape}")
+        print(f"Upper Shape of y_upper_target: {z_cst_snap.shape}, Lower Shape of y_lower_target: {z_cst_snap.shape}")
 
         #y_target = np.concatenate([y_upper_target, y_lower_target])
 
         #print(f"Shape of y_ideal: {y_target.shape}, Shape of y_kt_foil: {y_kt_foil.shape}")
         print(f"Shape of zeta_g: {zeta_g.shape} ")
         plt.figure(figsize=(10, 6))
-        plt.plot(kt_closest_upper.real, kt_closest_upper.imag, 'bo-', label='Target Upper Surface')
-        plt.plot(x_kt_foil_upper, y_kt_foil_upper, 'go-', label='KT Airfoil - Upper', markersize=4)
-        plt.quiver(kt_closest_upper.real, kt_closest_upper.imag, kt_normal_upper[:, 0], kt_normal_upper[:, 1], 
+        plt.plot(z_cst_snap.real, z_cst_snap.imag, 'bo-', label='Target  Surface')
+        plt.plot(z_kt_foil.real, z_kt_foil.imag, 'go-', label='KT Airfoil ', markersize=4)
+        plt.quiver(z_cst_snap.real, z_cst_snap.imag, kt_normals[:, 0], kt_normals[:, 1], 
                color='blue', 
                angles='xy', 
                scale_units='xy', 
                scale=5, 
                width=0.003,
                label='K-T Normals on Target Upper')
-        plt.plot(kt_closest_lower.real, kt_closest_lower.imag, 'ms-', label='Target Lower Surface')
-        plt.plot(x_kt_foil_lower, y_kt_foil_lower, 'rs-', label='KT Airfoil - Lower', markersize=4)
-        plt.quiver(kt_closest_lower.real, kt_closest_lower.imag, kt_normal_lower[:, 0], kt_normal_lower[:, 1], 
-               color='magenta', 
-               angles='xy', 
-               scale_units='xy', 
-               scale=5, 
-               width=0.003,
-               label='K-T Normals on Target Lower')
+
         plt.legend()
 
         plt.xlabel('x')
@@ -515,11 +610,47 @@ def convert(dataset_root, output_folder, xlen, ylen, xoffset, grid_size):
         plt.show()
 
         # update the K-T grid to snap to the CST surface
+
+        print(f" Shape of z_cst_snap: {z_cst_snap.shape}, Shape of z_kt_foil: {z_kt_foil.shape} ")
         zeta_g_snapped = zeta_g.copy()
-        zeta_g_snapped[1:-1, 0] = x_kt_foil[1:-1] + 1j * y_upper_target[1:-1]
 
-        kt_foil.pyvista_mesh(zeta_g_snapped)
 
+        # lock the height of the first layer of points above the surface to prevent issues with the elliptic solver near the surface
+        # 1. Snap the surface (j=0) 
+        #zeta_g_snapped = zeta_g.copy()
+        #zeta_g_snapped.real[1:-2, 0] = z_cst_snap[1:-2].real
+        #zeta_g_snapped.imag[1:-2, 0] = z_cst_snap[1:-2].imag
+
+        # 2. Extract the exact normal vector and distance of the original 1st cell
+        #dx_wall = zeta_g.real[:, 1] - zeta_g.real[:, 0]
+        #dy_wall = zeta_g.imag[:, 1] - zeta_g.imag[:, 0]
+
+        # 3. Apply this exact offset to the newly snapped surface
+        #zeta_g_snapped.real[:, 1] = zeta_g_snapped.real[:, 0] + dx_wall
+        #zeta_g_snapped.imag[:, 1] = zeta_g_snapped.imag[:, 0] + dy_wall
+
+        #kt_foil.pyvista_mesh(zeta_g_snapped)
+
+        #zeta_g_smooth = zeta_g_snapped.copy()
+
+        # calculate source terms P and Q from the initial K-T grid
+        #P, Q = kt_foil.compute_source_terms(zeta_g.real, zeta_g.imag)
+        
+        #print(f"Computed source terms P and Q with shapes {P.shape} and {Q.shape}")
+
+        #P = P*0
+
+        #Q = Q*0
+
+        #zeta_g_smooth.real, zeta_g_smooth.imag = kt_foil.smooth_elliptic_grid(zeta_g_smooth.real, zeta_g_smooth.imag, P, Q, iterations=1000)
+        
+        #kt_foil.pyvista_mesh(zeta_g_smooth)
+        zeta_g_smooth = kt_foil.algebraic_grid_blend(zeta_g, z_cst_snap, decay_power=1.0)
+
+        kt_foil.pyvista_overlay_mesh(zeta_g, zeta_g_snapped)
+
+
+        kt_foil.pyvista_overlay_mesh(zeta_g, zeta_g_smooth)
 
 
 
