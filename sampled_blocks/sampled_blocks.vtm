@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<VTKFile type="vtkMultiBlockDataSet" version="1.0" byte_order="LittleEndian">
+  <vtkMultiBlockDataSet>
+    <DataSet index="0" name="block_0" file="block_0.vts"/>
+    <DataSet index="1" name="block_3" file="block_3.vts"/>
+    <DataSet index="2" name="block_5" file="block_5.vts"/>
+    <DataSet index="3" name="block_4" file="block_4.vts"/>
+    <DataSet index="4" name="block_2" file="block_2.vts"/>
+    <DataSet index="5" name="block_1" file="block_1.vts"/>
+  </vtkMultiBlockDataSet>
+</VTKFile>
