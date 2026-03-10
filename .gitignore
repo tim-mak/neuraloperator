@@ -1,6 +1,18 @@
 # weights and biases
-.wandb/ 
+.wandb/
+wandb/
 wandb_api_key.txt
+
+# Generated plots and figures
+*.png
+
+# PyTorch data files
+*.pt
+
+# Local work data directories (generated outputs, not source)
+tims/**/*.png
+tims/**/*.pt
+neuralop/data/datasets/data/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
