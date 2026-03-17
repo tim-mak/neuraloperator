@@ -23,9 +23,6 @@ def main():
         "--wandb.entity", "tim-mak-ntnu",  # Your WandB username
         "--wandb.name", "fno-airfrans-C-Mesh",
         "--wandb.log_output", "True",  # Disable output logging to avoid shape issues
-        "--opt.n_epochs", "1000",  # Short test run first
-        "--data.batch_size", "16",
-        "--save_interval", "20",
         "--verbose", "True"
     ]
     

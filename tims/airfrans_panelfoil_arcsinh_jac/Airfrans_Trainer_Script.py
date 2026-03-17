@@ -13,14 +13,14 @@ from neuralop import H1Loss, LpLoss, Trainer, get_model
 from neuralop.training import setup, AdamW
 from neuralop.mpu.comm import get_local_rank
 from neuralop.utils import get_wandb_api_key, count_model_params    
-from tims.airfrans_panelfoil.WeightedFieldwiseAggregatorLoss import WeightedFieldwiseAggregatorLoss
-from tims.airfrans_panelfoil.Airfrans_Delta_Dataset import load_airfrans_dataset, get_dataset_stats
+from tims.airfrans_panelfoil_arcsinh_jac.WeightedFieldwiseAggregatorLoss import WeightedFieldwiseAggregatorLoss
+from tims.airfrans_panelfoil_arcsinh_jac.Airfrans_Delta_ArcSinh_Jacobian_Dataset import load_airfrans_dataset, get_dataset_stats, verify_input_encoder, verify_output_encoder
+from tims.airfrans_panelfoil_arcsinh_jac.Airfrans_Delta_Config import Default
+from tims.airfrans_panelfoil_arcsinh_jac.Airfrans_Delta_Trainer import AirfransDeltaTrainer
 from zencfg import make_config_from_cli
-from tims.airfrans_panelfoil.Airfrans_Delta_Config import Default
-from tims.airfrans_panelfoil.Airfrans_Delta_Trainer import AirfransDeltaTrainer
-
 import pandas as pd
 
+from neuralop.losses import H1Loss
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -48,60 +48,6 @@ def plot_convergence(csv_path):
     plt.show()
 
 
-def verify_input_encoder(encoder):
-    print(f"\n{'='*20} INPUT ENCODER AUDIT {'='*20}")
-    if encoder is None:
-        print("No input encoder detected. Skipping audit.")
-        return
-    # 1. Check Channel Dimensions
-    mean = encoder.mean.flatten()
-    std = encoder.std.flatten()
-    print(f"Stats Shape: {list(encoder.mean.shape)} | Channels detected: {len(mean)}")
-
-    # 2. Check Physical Mapping
-    # We expect 5 channels of stats representing [u_inf, v_inf, mask, sdf, log_Re]
-    # Mask should be unaltered min=0, max=1
-    #names = ["x (inf)", "v_velocity (inf)", "mask", "SDF (geometry)", "log_Re"]
-    names = ["X", "Y", "U_x_pot", "U_y_pot","Cp_pot", "exp_sdf","arcsinh(x_xi)","arcsinh(x_eta)","arcsinh(y_xi)","arcsinh(y_eta)","log(det_J) "]
-
-    print(f"\n{'Channel':<20} | {'Mean':>10} | {'Std':>10}")
-    print("-" * 45)
-    for i, name in enumerate(names):
-        m, s = mean[i].item(), std[i].item()
-        print(f"{name:<20} | {m:>10.4f} | {s:>10.4f}")
-
-    # 3. Verify Selective Logic
-    channels = getattr(encoder, 'channels_to_normalize', [])
-    print(f"\nActive Channels for Normalization: {channels}")
-    
-    if 5 in channels:
-        print("!! WARNING: Channel 5 (exp_sdf) is set to be normalized! This will corrupt geometry.")
-    else:
-        print("✓ SUCCESS: Channel 5 (exp_sdf) will be passed through untouched.")
-    print(f"{'='*63}\n")
-
-def verify_output_encoder(encoder):
-    print(f"\n{'='*20} OUTPUT ENCODER AUDIT {'='*20}")
-    if encoder is None:
-        print("No output encoder detected. Skipping audit.")
-        return
-    # 1. Check Channel Dimensions
-    mean = encoder.mean.flatten()
-    std = encoder.std.flatten()
-    print(f"Stats Shape: {list(encoder.mean.shape)} | Channels detected: {len(mean)}")
-
-    # 2. Check Physical Mapping
-    # We expect 4 channels of stats representing [u_deficit, v_deficit, Cp, log_nut_ratio]
-    # which will be applied to indices [0, 1, 2, 3] of the 4D output.
-    names = ["Cp_delta", "U_x_delta", "U_y_delta", "log_nut_ratio"]
-    
-    print(f"\n{'Channel':<20} | {'Mean':>10} | {'Std':>10}")
-    print("-" * 45)
-    for i, name in enumerate(names):
-        m, s = mean[i].item(), std[i].item()
-        print(f"{name:<20} | {m:>10.4f} | {s:>10.4f}")
-
-    print(f"{'='*63}\n")
 
 
 def save_checkpoint(checkpoint_dir, model, data_processor, epoch, filename):
@@ -117,9 +63,6 @@ def save_checkpoint(checkpoint_dir, model, data_processor, epoch, filename):
         'data_processor': data_processor.state_dict(),
         'config': config
     }, checkpoint_dir / filename)
-
-
-
 
 
 config = make_config_from_cli(Default)
@@ -241,13 +184,44 @@ train_loss_fn = WeightedFieldwiseAggregatorLoss(
     logging_enabled=True
 )
 
+
+# MAE (L1) gives you literal physical error (e.g., "off by 0.5 m/s")
+mae_functions = {
+    'Cp_delta': nn.L1Loss(),
+    'U_x_delta': nn.L1Loss(),
+    'U_y_delta': nn.L1Loss(),
+    'log_nutratio': nn.L1Loss()
+}
+
+# H1 Loss measures the error of the values AND their spatial gradients (shear/vorticity)
+h1_functions = {
+    'Cp_delta': H1Loss(d=2),
+    'U_x_delta': H1Loss(d=2),
+    'U_y_delta': H1Loss(d=2),
+    'log_nutratio': H1Loss(d=2) # Or leave as MSE if H1 is too heavy for turbulence
+}
+
+
 # Evaluation losses with no logging to avoid the tuple error
-eval_loss_object = WeightedFieldwiseAggregatorLoss( loss_functions,
+eval_lp_loss_object = WeightedFieldwiseAggregatorLoss( loss_functions,
                                                    loss_mappings,
                                                      loss_weights, 
                                                      logging_enabled=False)
 
-eval_losses = {"weightedFieldLoss": eval_loss_object}
+eval_mae_loss_object = WeightedFieldwiseAggregatorLoss( mae_functions,
+                                                   loss_mappings,
+                                                     loss_weights, 
+                                                     logging_enabled=False)
+
+eval_h1_loss_object = WeightedFieldwiseAggregatorLoss( h1_functions,
+                                                   loss_mappings,
+                                                     loss_weights, 
+                                                     logging_enabled=False)
+
+
+eval_losses = {"Weighted_Relative_Lp2": eval_lp_loss_object,
+               "Weighted_Absolute_MAE" : eval_mae_loss_object,
+               "Weighted_Physics_H1" : eval_h1_loss_object}
 
 
 # Model initialization
@@ -285,8 +259,6 @@ elif config.opt.scheduler == "StepLR":
     )
 else:
     raise ValueError(f"Got scheduler={config.opt.scheduler}")
-
-
 
 
 

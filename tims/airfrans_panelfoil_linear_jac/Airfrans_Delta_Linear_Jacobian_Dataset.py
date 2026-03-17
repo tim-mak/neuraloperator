@@ -14,14 +14,18 @@ from neuralop.data.transforms.normalizers import UnitGaussianNormalizer
 from torch.utils.data import DataLoader
 from torch.utils.data.dataset import Dataset
 
-from tims.airfrans_panelfoil.Airfrans_DataProcessor import AirfransDataProcessor
-from tims.airfrans_panelfoil.Airfrans_Evaluator import AirfoilEvaluator
+from tims.airfrans_panelfoil_linear_jac.Airfrans_DataProcessor_Linear_Jacobian import AirfransDataProcessor_Linear_Jacobian
+from tims.airfrans_panelfoil_linear_jac.Airfrans_Evaluator import AirfoilEvaluator
 from tims.airfrans_panelfoil.SelectiveUnitGaussianNormalizer import SelectiveUnitGaussianNormalizer
 from torch.utils.data._utils.collate import default_collate
 
 import zencfg
 from neuralop.models.base_model import get_model
 from tqdm import tqdm
+
+input_names =  ["X", "Y", "U_x_pot", "U_y_pot","Cp_pot", "exp_sdf","x_xi","x_eta","y_xi","y_eta","det_J"]
+
+output_names = ["Cp_delta", "U_x_delta", "U_y_delta", "log_nut_ratio"]
 
 def collate_batch_with_props(batch):
     """
@@ -39,6 +43,59 @@ def collate_batch_with_props(batch):
     
     return collated_batch
 
+def verify_input_encoder(encoder):
+    print(f"\n{'='*20} INPUT ENCODER AUDIT {'='*20}")
+    if encoder is None:
+        print("No input encoder detected. Skipping audit.")
+        return
+    # 1. Check Channel Dimensions
+    mean = encoder.mean.flatten()
+    std = encoder.std.flatten()
+    print(f"Stats Shape: {list(encoder.mean.shape)} | Channels detected: {len(mean)}")
+
+    # 2. Check Physical Mapping
+    # We expect 5 channels of stats representing [u_inf, v_inf, mask, sdf, log_Re]
+    # Mask should be unaltered min=0, max=1
+    #names = ["x (inf)", "v_velocity (inf)", "mask", "SDF (geometry)", "log_Re"]
+    #names = ["X", "Y", "U_x_pot", "U_y_pot","Cp_pot", "exp_sdf","x_xi","x_eta","y_xi","y_eta","det_J"]
+
+    print(f"\n{'Channel':<20} | {'Mean':>10} | {'Std':>10}")
+    print("-" * 45)
+    for i, name in enumerate(input_names):
+        m, s = mean[i].item(), std[i].item()
+        print(f"{name:<20} | {m:>10.4f} | {s:>10.4f}")
+
+    # 3. Verify Selective Logic
+    channels = getattr(encoder, 'channels_to_normalize', [])
+    print(f"\nActive Channels for Normalization: {channels}")
+    
+    if 5 in channels:
+        print("!! WARNING: Channel 5 (exp_sdf) is set to be normalized! This will corrupt geometry.")
+    else:
+        print("✓ SUCCESS: Channel 5 (exp_sdf) will be passed through untouched.")
+    print(f"{'='*63}\n")
+
+def verify_output_encoder(encoder):
+    print(f"\n{'='*20} OUTPUT ENCODER AUDIT {'='*20}")
+    if encoder is None:
+        print("No output encoder detected. Skipping audit.")
+        return
+    # 1. Check Channel Dimensions
+    mean = encoder.mean.flatten()
+    std = encoder.std.flatten()
+    print(f"Stats Shape: {list(encoder.mean.shape)} | Channels detected: {len(mean)}")
+
+    # 2. Check Physical Mapping
+    # We expect 4 channels of stats representing [u_deficit, v_deficit, Cp, log_nut_ratio]
+    # which will be applied to indices [0, 1, 2, 3] of the 4D output.
+    
+    print(f"\n{'Channel':<20} | {'Mean':>10} | {'Std':>10}")
+    print("-" * 45)
+    for i, name in enumerate(output_names):
+        m, s = mean[i].item(), std[i].item()
+        print(f"{name:<20} | {m:>10.4f} | {s:>10.4f}")
+
+    print(f"{'='*63}\n")
 
 def get_dataset_stats(training_file):
     
@@ -48,17 +105,10 @@ def get_dataset_stats(training_file):
     y = data['y']  # [N, 4, Gx, Gy
     # need to drop sdf channel for stats reporting since it is not used as input to the model and will not be normalized
     x =torch.cat([x[:, :5, :, :], x[:, 6:, :, :]], dim=1) 
-    # modify the input channels to be in a reasonable range before normalization 
-    x[:,7:9, :, :] = torch.arcsinh(x[:, 7:9, :, :] ) 
-    # modify jacobian channel to log(det_J) to keep values in a reasonable range for normalization
-    x[:, 10, :, :] = torch.log(x[:, 10, :, :] + 1e-8)
 
     print(f"Getting Raw Dataset Stats from {training_file}")
     print(f"Size of dataset {x.shape[0]} samples with input shape {x.shape} and target shape {y.shape}")
 
-    # Names for your 5-Channel Input (x) and 4-Channel Target (y)
-    x_names = ["X", "Y", "U_x_pot", "U_y_pot","Cp_pot", "exp_sdf","arcsinh(x_xi)","arcsinh(x_eta)","arcsinh(y_xi)","arcsinh(y_eta)","log(det_J) "]
-    y_names = ["Cp_delta", "U_x_delta", "U_y_delta", "log10(ν_t/ν)"]
 
     def print_stats(tensor, names, title):
         print(f"\n{'='*85}")
@@ -79,8 +129,8 @@ def get_dataset_stats(training_file):
     
             print(f"{name:<20} | {mean:>10.4f} | {std:>10.4f} | {c_min:>10.4f} | {c_max:>10.4f}")
     
-    print_stats(x, x_names, "INPUT CALIBRATION (x)")
-    print_stats(y, y_names, "TARGET CALIBRATION (y)")
+    print_stats(x, input_names, "INPUT CALIBRATION (x)")
+    print_stats(y, output_names, "TARGET CALIBRATION (y)")
 
 # Define a custom dataset class that includes properties dictionary with sample information
 class TensorDatasetWithProps(Dataset):
@@ -288,7 +338,7 @@ class AirfransDataset(PTDataset):
 
         
         # Create custom data processor that handles selective input normalization
-        self._data_processor = AirfransDataProcessor(
+        self._data_processor = AirfransDataProcessor_Linear_Jacobian(
             in_normalizer=input_encoder, 
             out_normalizer=output_encoder,
             xi_pad_frac=0.1

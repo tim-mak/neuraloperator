@@ -677,12 +677,13 @@ class AirfransDeltaTrainer(Trainer):
             x_input = sample['x'].to(self.device)
             # need to get y in normalized space for plotting
             y_norm_pred = self.model(x_input)
+            #n_eta = y_norm_pred.shape[-1]//2
+            #y_norm_pred_clip =y_norm_pred[:,:,:, :n_eta]  # manual clip of mirror
+#
             y_norm_truth = self.data_processor.out_normalizer.transform(y_raw)
 
-            # Slice both the prediction and the truth (sample['y']) back to 256 x 32
-            #y_pred, processed_sample = self.data_processor.postprocess(y_norm_pred, sample)
             # 4. Explicit Decoding to Physical Space
-            # Use the out_normalizer directly to ensure you have physical units for the loss
+            # Use the out_normalizer directly to ensure you have physical units for the loss postprocess clips y_norm_pred to unmirror
             y_phys_pred, processed_sample = self.data_processor.postprocess(y_norm_pred.clone(), sample)
 
             if isinstance(y_phys_pred, dict):
@@ -691,10 +692,13 @@ class AirfransDeltaTrainer(Trainer):
                 y_phys_pred = y_phys_pred
 
 
+            #print( f" Check normalised tensor size {y_norm_truth.shape}  and y_norm_pred size {y_norm_pred_clip.shape} and raw tensor size {y_raw.shape} for sample {sample_idx} at epoch {epoch}")    
+            #print( f" Check physicsl tensor size {y_raw.shape}  and y_phys_pred size {y_phys_pred.shape} for sample {sample_idx} at epoch {epoch}")    
+
+
             # For visualization, also calculate raw residuals
 
             residual_norm = y_norm_truth - y_norm_pred
-
             # Calc losses per channel
             n_channels = y_norm_truth.shape[1]
 
@@ -783,3 +787,11 @@ class AirfransDeltaTrainer(Trainer):
         outpufile_dir.mkdir(parents=True, exist_ok=True)    
         plt.savefig(f"{outpufile_dir}/{prefix}_{resolution_h}x{resolution_w}_sample_{sample_idx}_epoch_{epoch:04d}.png")
         plt.close()
+
+
+        # Current allocated memory
+        allocated = torch.cuda.memory_allocated(0) / (1024**3)
+        # Peak memory used since the start
+        peak = torch.cuda.max_memory_allocated(0) / (1024**3)
+
+        print(f"Current VRAM: {allocated:.2f} GB | Peak VRAM: {peak:.2f} GB")

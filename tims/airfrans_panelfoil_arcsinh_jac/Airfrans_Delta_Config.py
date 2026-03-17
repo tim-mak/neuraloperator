@@ -9,7 +9,7 @@ from config.wandb import WandbConfig
 
 class AirfransOptConfig(OptimizationConfig):
     n_epochs: int = 1000  # check cli arguments
-    learning_rate: float = 1e-3
+    learning_rate: float = 1e-4
     training_loss: str = "weighted_l2"
     weight_decay: float = 1e-4
     scheduler: str = "CosineAnnealingLR"
@@ -35,7 +35,7 @@ class AirfransDatasetConfig(ConfigBase):
     encoding: str = "channel-wise"
     channel_dim: int = 1
     weights: List[float] = [1.0, 1.0, 1.0, 1.0]  # Weights for [delta_Cp, delta_U_x, delta_U_y, log_nut_ratio] in loss calculation
-    model_storage_dir: str = "/home/timm/storage/AF_NO_DATASET/Model_FNO_linearX_base_Modes_16_8_V2"
+    model_storage_dir: str = "/home/timm/storage/AF_NO_DATASET/Model_FNO_arcsinh_Jac_Modes_16_8_V1"
 
 class Default(ConfigBase):
     n_params_baseline: Optional[Any] = None

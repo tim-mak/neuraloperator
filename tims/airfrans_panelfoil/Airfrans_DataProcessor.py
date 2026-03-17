@@ -24,7 +24,7 @@ class AirfransDataProcessor(DefaultDataProcessor):
         processed = super().preprocess(data)
         x, y = processed['x'], processed['y']
         # Get current dimensions: [Batch, Channel, Xi, Eta]
-        n_xi = x.shape[2]
+        #n_xi = x.shape[2]
         #min_padded_size = int(math.ceil(n_xi * (1 + self.xi_pad_frac)))
         # Find next power of 2 (e.g., 282 -> 512) needed iby cuFFT for half precision
         #target_xi = 2**math.ceil(math.log2(min_padded_size))
@@ -61,5 +61,6 @@ class AirfransDataProcessor(DefaultDataProcessor):
         #output = output[..., :, :n_eta] # Since we mirrored, we can just take the first half of the xi dimension
         # 2. Also unpad the ground truth so the Loss Function is comparing  tensors of truth size
         if 'y' in data_dict:
+            #data_dict['y'] = data_dict['y'][..., :n_eta]
             data_dict['y'] = data_dict['y']
         return super().postprocess(output,data_dict)
