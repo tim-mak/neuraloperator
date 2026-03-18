@@ -42,9 +42,9 @@ class DomainPadding(nn.Module):
 
     def forward(self, x):
         """
-        forward pass: pad the input
+        forward pass: pad the input  ( not  actually a forward pass in the sense of a neural network layer, but we implement it as such for ease of use in the data processor)
         """
-        self.pad(x)
+        return self.pad(x)
 
     def pad(self, x, verbose=False):
         """Take an input and pad it by the desired fraction

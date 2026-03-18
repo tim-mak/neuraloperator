@@ -1,4 +1,4 @@
-from tims.airfrans_panelfoil_linear_jac.Airfrans_Evaluator import AirfoilEvaluator
+from tims.airfrans_panelfoil_pad_linear.Airfrans_Evaluator import AirfoilEvaluator
 from neuralop.training.trainer import Trainer
 from typing import Union
 from pathlib import Path
@@ -16,8 +16,9 @@ import numpy as np
 
 class AirfransDeltaTrainer(Trainer):
 
-    def __init__(self, *, model, n_epochs, wandb_log=False, device="cpu", mixed_precision=False, data_processor=None, eval_interval=1, log_output=False, use_distributed=False, verbose=False):
+    def __init__(self, *, model, n_epochs, wandb_log=False, device="cpu", mixed_precision=False, data_processor=None, eval_interval=1, log_output=False, use_distributed=False, verbose=False, grad_clip=None):
         self.evaluator = AirfoilEvaluator(processor=data_processor, device=device)
+        self.grad_clip = grad_clip   # Max global gradient norm, e.g. 1.0
         super().__init__(model=model, n_epochs=n_epochs, wandb_log=wandb_log, device=device, mixed_precision=mixed_precision, data_processor=data_processor, eval_interval=eval_interval, log_output=log_output, use_distributed=use_distributed, verbose=verbose)
 
     def eval_one_batch(self, sample: dict, eval_losses: dict, return_output: bool = False):
@@ -141,7 +142,7 @@ class AirfransDeltaTrainer(Trainer):
             sys.stdout.flush()
 
         for epoch in range(self.start_epoch, self.n_epochs):
-            train_err, avg_loss, avg_lasso_loss, epoch_train_time = self.train_one_epoch(epoch, train_loader, training_loss)
+            train_err, avg_loss, avg_lasso_loss, epoch_train_time, channel_metrics, lr = self.train_one_epoch(epoch, train_loader, training_loss)
             epoch_metrics = dict(train_err=train_err, avg_loss=avg_loss, avg_lasso_loss=avg_lasso_loss, epoch_train_time=epoch_train_time)
 
             if epoch % self.eval_interval == 0:
@@ -151,7 +152,19 @@ class AirfransDeltaTrainer(Trainer):
                 if save_best is not None and eval_metrics[save_best] < best_metric_value:
                     best_metric_value = eval_metrics[save_best]
                     self.checkpoint(save_dir)
-                
+
+                if self.verbose and epoch % self.eval_interval == 0:
+                    self.log_training(
+                        epoch=epoch,
+                        time=epoch_train_time,
+                        avg_loss=avg_loss,
+                        train_err=train_err,
+                        channel_metrics=channel_metrics,
+                        eval_metrics=eval_metrics,  # Eval metrics will be logged in the main training loop after evaluation
+                        avg_lasso_loss=avg_lasso_loss,
+                        lr=lr,
+                    )
+                        
                 self.plot_diagnostic_grid(train_loader, epoch, save_dir=save_dir, sample_idx=sample_idx, training_loss=training_loss)
 
             if self.save_every is not None and epoch % self.save_every == 0:
@@ -178,6 +191,11 @@ class AirfransDeltaTrainer(Trainer):
         for idx, sample in enumerate(train_loader):
             loss, loss_per_channel = self.train_one_batch(idx, sample, training_loss)
             loss.backward()
+
+            # Gradient clipping
+            if hasattr(self, 'grad_clip') and self.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+
             self.optimizer.step()
 
             train_err += loss.item()
@@ -219,18 +237,7 @@ class AirfransDeltaTrainer(Trainer):
         
         lr = next((pg["lr"] for pg in self.optimizer.param_groups), None)
 
-        if self.verbose and epoch % self.eval_interval == 0:
-            self.log_training(
-                epoch=epoch,
-                time=epoch_train_time,
-                avg_loss=avg_loss,
-                train_err=train_err,
-                channel_metrics=channel_metrics,
-                avg_lasso_loss=avg_lasso_loss,
-                lr=lr,
-            )
-
-        return train_err, avg_loss, avg_lasso_loss, epoch_train_time
+        return train_err, avg_loss, avg_lasso_loss, epoch_train_time,channel_metrics, lr
 
     def train_one_batch(self, idx, sample, training_loss):
         self.optimizer.zero_grad(set_to_none=True)
@@ -268,22 +275,21 @@ class AirfransDeltaTrainer(Trainer):
 
         return loss, channel_batch_losses
         
-    def log_training(self,
-                      epoch: int, 
-                      time: float,
-                      avg_loss: float,
-                      train_err: float,
-                      channel_metrics: dict = None,
-                      eval_metrics: dict = None,
-                      avg_lasso_loss: float = None,
-                      lr: float = None):
+    def log_training(self, 
+                     epoch: int, 
+                     time: float, 
+                     avg_loss: float, 
+                     train_err: float, 
+                     channel_metrics: dict = None, 
+                     eval_metrics: dict = None,
+                     avg_lasso_loss: float = None, lr: float = None):
         
         channel_metrics = channel_metrics or {}
         eval_metrics = eval_metrics or {}
         
         if self.log_output:
             if self.wandb_log:
-                values_to_log = dict(train_err=train_err, time=time, avg_loss=avg_loss, avg_lasso_loss=avg_lasso_loss, lr=lr, **channel_metrics)
+                values_to_log = dict(train_err=train_err, time=time, avg_loss=avg_loss, avg_lasso_loss=avg_lasso_loss, lr=lr, **channel_metrics, **eval_metrics)
                 wandb.log(data=values_to_log, step=epoch + 1, commit=False)
             
             log_path = self.save_dir / "loss_history.csv"
@@ -306,62 +312,61 @@ class AirfransDeltaTrainer(Trainer):
                 msg += f", {k}={channel_metrics[k]:.4f}"
             print(msg)
 
+            if not hasattr(self, '_plot_history'):
+                self._plot_history = {'epoch': [], 'train_err': [], 'lr': []}
+            
+            self._plot_history['epoch'].append(epoch)
+            self._plot_history['train_err'].append(train_err)
+            self._plot_history['lr'].append(lr)
+            
+            # Track channel losses
+            for k, v in channel_metrics.items():
+                if k not in self._plot_history:
+                    self._plot_history[k] = []
+                self._plot_history[k].append(v)
+                
+            # Track eval metrics
+            for k, v in eval_metrics.items():
+                if k not in self._plot_history:
+                    self._plot_history[k] = []
+                self._plot_history[k].append(v)
+
+
+            plt.figure(figsize=(10, 6))
+            
+            # Plot the overall training error
+            plt.plot(self._plot_history['epoch'], self._plot_history['train_err'], color='black', label="Total Train Err", linewidth=2)
+            
+            # Plot individual channel training losses
+            cmap = plt.get_cmap('tab10')
+            for i, k in enumerate(channel_metrics.keys()):
+                plt.plot(self._plot_history['epoch'], self._plot_history[k], color=cmap(i), linestyle='-', label=f"Train: {k}")
+                
+            # Plot validation/evaluation metrics
+            for i, k in enumerate(eval_metrics.keys()):
+                plt.plot(self._plot_history['epoch'], self._plot_history[k], color=cmap(i), linestyle='--', label=f"Eval: {k}")
+
+            plt.grid(True, which="both", ls="--", alpha=0.5)
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss Magnitude")
+            plt.yscale('log')  # Log scale is critical for seeing plateaus in PDE solving
+            plt.title(f'Training Metrics History (Epoch {epoch+1})')
+            
+            # Put legend outside the plot so it doesn't cover the lines
+            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+            
+            # Save the plot
+            plot_dir = self.save_dir / "loss_curves"
+            plot_dir.mkdir(parents=True, exist_ok=True)
+            file = plot_dir / f"loss_curve_epoch_{epoch+1:04d}.png"
+            
+            plt.savefig(file, bbox_inches='tight', pad_inches=0.1, dpi=150, facecolor="white")
+            
+            # Close the plot to prevent massive RAM leaks
+            plt.close("all")
+
         if not self.regularizer and not self.log_output:
             print(f"Logging disabled on {self.device} not logging metrics.")
-
-# --- 2. In-Memory History Tracking ---
-        if not hasattr(self, '_plot_history'):
-            self._plot_history = {'epoch': [], 'train_err': []}
-        
-        self._plot_history['epoch'].append(epoch)
-        self._plot_history['train_err'].append(train_err)
-        
-        # Track channel losses
-        for k, v in channel_metrics.items():
-            if k not in self._plot_history:
-                self._plot_history[k] = []
-            self._plot_history[k].append(v)
-            
-        # Track eval metrics (if provided)
-        for k, v in eval_metrics.items():
-            if k not in self._plot_history:
-                self._plot_history[k] = []
-            self._plot_history[k].append(v)
-
-        # --- 3. Periodic Plotting ---
-        plt.figure(figsize=(10, 6))
-            
-        # Plot the overall training error
-        plt.plot(self._plot_history['epoch'], self._plot_history['train_err'], color='black', label="Total Train Err", linewidth=2)
-        
-        # Plot individual channel training losses
-        cmap = plt.get_cmap('tab10')
-        for i, k in enumerate(channel_metrics.keys()):
-            plt.plot(self._plot_history['epoch'], self._plot_history[k], color=cmap(i), linestyle='-', label=f"Train: {k}")
-            
-        # Plot validation/evaluation metrics
-        for i, k in enumerate(eval_metrics.keys()):
-            plt.plot(self._plot_history['epoch'], self._plot_history[k], color=cmap(i), linestyle='--', label=f"Eval: {k}")
-
-        plt.grid(True, which="both", ls="--", alpha=0.5)
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss Magnitude")
-        plt.yscale('log')  # Log scale is critical for seeing plateaus in PDE solving
-        plt.title(f'Training Metrics History (Epoch {epoch+1})')
-        
-        # Put legend outside the plot so it doesn't cover the lines
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        
-        # Save the plot
-        plot_dir = self.save_dir / "loss_curves"
-        plot_dir.mkdir(parents=True, exist_ok=True)
-        file = plot_dir / f"loss_curve_epoch_{epoch+1:04d}.png"
-        
-        plt.savefig(file, bbox_inches='tight', pad_inches=0.1, dpi=150, facecolor="white")
-        
-        # Close the plot to prevent massive RAM leaks
-        plt.close("all")
-
 
     def plot_diagnostic_grid(self, loader, epoch, save_dir="plots", sample_idx=0, prefix="prediction", training_loss=None):
             # Prevent secondary GPUs from overlapping file writes
@@ -463,64 +468,107 @@ class AirfransDeltaTrainer(Trainer):
             plt.savefig(f"{output_dir}/{prefix}_fields_{resolution_h}x{resolution_w}_sample_{sample_idx}_epoch_{epoch:04d}.png")
             plt.close(fig)
 
-    # --- Plotting All Spectrograms ---
             if fft_storage:
                 import matplotlib.patches as patches
                 
                 num_layers = len(fft_storage)
-                # Create a wide figure to fit all layers side-by-side
-                fig_fft, axes_fft = plt.subplots(1, num_layers, figsize=(6 * num_layers, 5))
+                # Create a 2-row grid: Row 0 = Inputs, Row 1 = Outputs
+                fig_fft, axes_fft = plt.subplots(2, num_layers, figsize=(6 * num_layers, 10))
                 
-    # 1. Calculate GLOBAL min and max across all layers for consistent color scaling
-                global_vmin = min([np.min(data) for data in fft_storage.values()])
-                global_vmax = max([np.max(data) for data in fft_storage.values()])
+                # Ensure axes_fft is a 2D array even if there's only 1 layer
+                if num_layers == 1:
+                    axes_fft = np.expand_dims(axes_fft, axis=1)
+                    
+                fig_fft.suptitle(f"FNO Spatial Frequencies (Positive Quadrant) : Epoch {epoch}", fontsize=20, y=1.02)
                 
-                for ax, layer_name in zip(axes_fft, sorted(fft_storage.keys())):
-                    spec_data = fft_storage[layer_name]
+                # 1. Calculate GLOBAL min and max across ALL inputs and outputs
+                all_data = []
+                for layer_data in fft_storage.values():
+                    all_data.append(layer_data['input'])
+                    all_data.append(layer_data['output'])
+                global_vmin = min([np.min(d) for d in all_data])
+                global_vmax = max([np.max(d) for d in all_data])
+                
+                # 2. Loop through the layers to populate the columns
+                for col, layer_name in enumerate(sorted(fft_storage.keys())):
+                    # Get the top and bottom axes for this specific layer column
+                    ax_in = axes_fft[0, col]
+                    ax_out = axes_fft[1, col]
                     
-                    n_xi, n_eta = spec_data.shape
-                    freq_extent = [-n_xi//2, n_xi//2, -n_eta//2, n_eta//2]
+                    data_dict = fft_storage[layer_name]
                     
-                    # 2. Lock the color scale using vmin and vmax
-                    im_spec = ax.imshow(
-                        spec_data.T, 
-                        origin='lower', 
-                        cmap='magma', 
-                        extent=freq_extent,
-                        aspect='auto',
-                        vmin=global_vmin,  # Locked global min
-                        vmax=global_vmax   # Locked global max
-                    )
-                    
-                    ax.set_title(f"Layer: {layer_name}", fontsize=14)
-                    ax.set_xlabel("Chordwise Wavenumber ($k_\\xi$)")
-                    if ax == axes_fft[0]:
-                        ax.set_ylabel("Normal Wavenumber ($k_\\eta$)")
-                    
-                    plt.colorbar(im_spec, ax=ax, fraction=0.046, pad=0.04, label="Log Magnitude")
-                    
-                    if hasattr(self.model, 'n_modes'):
-                        m_xi, m_eta = self.model.n_modes[0], self.model.n_modes[1]
+                    # Loop to plot Input (Top) then Output (Bottom)
+                    for ax, data, label in zip([ax_in, ax_out], 
+                                            [data_dict['input'], data_dict['output']], 
+                                            ['Input to', 'Output of']):
                         
-                        rect = patches.Rectangle(
-                            (-m_xi, -m_eta), 
-                            2 * m_xi,        
-                            2 * m_eta,       
-                            linewidth=2, 
-                            edgecolor='cyan', 
-                            facecolor='none', 
-                            linestyle='--'
-                        )
-                        ax.add_patch(rect)
+                        # Full Complex FFT in X direction but only positive frequencies in Y direction
 
-                plt.tight_layout()                
-                # Save the multi-layer plot
+                        # A. Slice to keep FULL X (Chordwise) and ONLY Positive Y (Normal)
+                        # The FFT data is centered, so we take the right half for positive frequencies
+                        n_xi, n_eta = data.shape
+                        center_xi, center_eta = n_xi // 2, n_eta // 2
+                        
+                        # Keep all rows (:), but only the right half of the columns (center_eta:)
+                        half_spec = data[:, center_eta:]
+                        
+                        # B. Update extent so X goes from -center to +center, and Y starts at 0
+                        freq_extent = [-center_xi, center_xi, 0, center_eta]
+                        
+                        # C. Plot with locked global scaling
+                        im_spec = ax.imshow(
+                            half_spec.T, 
+                            origin='lower', 
+                            cmap='magma', 
+                            extent=freq_extent,
+                            aspect='auto',
+                            vmin=global_vmin,
+                            vmax=global_vmax
+                        )
+                        
+                        ax.set_title(f"{label} {layer_name}", fontsize=14)
+                        ax.set_xlabel("Chordwise Wavenumber ($k_\\xi$)")
+                        if col == 0:
+                            ax.set_ylabel("Normal Wavenumber ($k_\\eta$)")
+                        
+                        # D. Draw the Symmetrical Cutoff Box
+                        if hasattr(self.model, 'n_modes'):
+                            # 1. X-Axis: 32 positive + 32 negative
+                            m_xi = self.model.n_modes[0] // 2 
+                            
+                            # 2. Y-Axis: Handle the physical reflection padding
+                            m_eta_raw = self.model.n_modes[1]
+                            if hasattr(self.model, 'domain_padding') and self.model.domain_padding is not None:
+                                if self.model.domain_padding.__class__.__name__ == "MirrorPaddingY":
+                                    m_eta = m_eta_raw // 2  
+                                else:
+                                    m_eta = m_eta_raw
+                            else:
+                                m_eta = m_eta_raw
+
+                            rect = patches.Rectangle(
+                                (-m_xi, 0),    # Anchor shifts left to capture negative X
+                                2 * m_xi,      # Width is now total modes (positive + negative)
+                                m_eta,         # Height remains just the positive Y
+                                linewidth=2, 
+                                edgecolor='cyan', 
+                                facecolor='none', 
+                                linestyle='--'
+                            )
+                            ax.add_patch(rect)
+
+                # Add a single colorbar to the right of the entire figure
+                cbar_ax = fig_fft.add_axes([0.92, 0.15, 0.02, 0.7]) # [left, bottom, width, height]
+                fig_fft.colorbar(im_spec, cax=cbar_ax, label="Log Magnitude")
+                
+                plt.subplots_adjust(left=0.05, right=0.9, wspace=0.2, hspace=0.3)
+                
                 spec_dir = safe_base_dir / "spectrograms"
                 spec_dir.mkdir(parents=True, exist_ok=True)
                 
-                spec_path = spec_dir / f"{prefix}_fft_all_layers_sample_{sample_idx}_epoch_{epoch:04d}.png"
+                spec_path = spec_dir / f"{prefix}_fft_in_out_sample_{sample_idx}_epoch_{epoch:04d}.png"
                 plt.savefig(spec_path, bbox_inches='tight')
-                print(f"📻 Saved Multi-Layer Spectrogram to: {spec_path}")
+                print(f"📻 Saved Input/Output Spectrogram to: {spec_path}")
                 plt.close(fig_fft)
 
             allocated = torch.cuda.memory_allocated(0) / (1024**3)
@@ -528,36 +576,26 @@ class AirfransDeltaTrainer(Trainer):
             print(f"Current VRAM: {allocated:.2f} GB | Peak VRAM: {peak:.2f} GB")
 
     def _register_fft_hook(self):
-            """
-            Attaches a hook to EVERY Fourier layer to intercept data, perform a 2D FFT, 
-            and save the centered spectrograms.
-            Returns a list of handles (to remove later) and the dictionary of data.
-            """
             storage = {}
             handles = []
             
-            # We need a factory function to avoid Python's late-binding loop closure trap
             def get_hook(layer_name):
                 def hook(module, input, output):
-                    # Intercept the input to the layer (Shape: [Batch, Channels, Xi, Eta])
-                    x = input[0].detach()
+                    # --- 1. Process INPUT ---
+                    x_in = input[0].detach()
+                    x_in_ft = torch.fft.fftshift(torch.fft.fft2(x_in), dim=(-2, -1))
+                    mag_in = torch.log1p(torch.abs(x_in_ft))[0].mean(dim=0).cpu().numpy()
                     
-                    # 1. Perform full 2D FFT
-                    x_ft = torch.fft.fft2(x)
+                    # --- 2. Process OUTPUT ---
+                    x_out = output.detach()
+                    x_out_ft = torch.fft.fftshift(torch.fft.fft2(x_out), dim=(-2, -1))
+                    mag_out = torch.log1p(torch.abs(x_out_ft))[0].mean(dim=0).cpu().numpy()
                     
-                    # 2. Shift the zero-frequency (DC) to the center
-                    x_ft_shifted = torch.fft.fftshift(x_ft, dim=(-2, -1))
-                    
-                    # 3. Log Magnitude
-                    mag = torch.log1p(torch.abs(x_ft_shifted))
-                    
-                    # 4. Average across hidden channels for Sample 0
-                    storage[layer_name] = mag[0].mean(dim=0).cpu().numpy()
+                    # Store both
+                    storage[layer_name] = {'input': mag_in, 'output': mag_out}
                 return hook
 
-            # Loop through the model and hook all spectral conv blocks
             for name, module in self.model.named_modules():
-                # Targets NeuralOperator's standard naming: fno_blocks.convs.0, .1, .2, etc.
                 if "fno_blocks.convs." in name and name.split(".")[-1].isdigit():
                     handles.append(module.register_forward_hook(get_hook(name)))
                     

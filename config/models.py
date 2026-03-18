@@ -1,4 +1,4 @@
-from typing import List, Literal, Optional, Any
+from typing import List, Literal, Optional, Any, Union
 from zencfg import ConfigBase
 
 
@@ -17,7 +17,7 @@ class FNOConfig(ModelConfig):
     lifting_channel_ratio: int = 2
     projection_channel_ratio: int = 4
     n_layers: int = 4
-    domain_padding: float = 0.0
+    domain_padding: Union[float, List[float]] = 0.0
     norm: str = "None"
     fno_skip: str = "linear"
     implementation: str = "factorized"
