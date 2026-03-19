@@ -18,7 +18,10 @@ from tims.airfrans_panelfoil_pad_linear.Airfrans_DataProcessor_Linear_Jacobian i
 from tims.airfrans_panelfoil_pad_linear.Airfrans_Evaluator import AirfoilEvaluator
 from tims.airfrans_panelfoil.SelectiveUnitGaussianNormalizer import SelectiveUnitGaussianNormalizer
 from torch.utils.data._utils.collate import default_collate
-
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
 import zencfg
 from neuralop.models.base_model import get_model
 from tqdm import tqdm
@@ -131,6 +134,93 @@ def get_dataset_stats(training_file):
     
     print_stats(x, input_names, "INPUT CALIBRATION (x)")
     print_stats(y, output_names, "TARGET CALIBRATION (y)")
+
+
+
+
+def plot_dataset_distributions(data_file, save_dir="channel_distributions"):
+    print(f"--- Loading Training Split: {data_file} ---")
+    data = torch.load(data_file)
+    
+    # Create output directory
+    save_path = Path(save_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
+    
+    # Define your channel names mapping
+    x_names = ["x", "y", "U_x_pot", "U_y_pot", "Cp_pot", "sdf", 
+               "exp_sdf", "x_xi", "x_eta", "y_xi", "y_eta", "det_J"]
+    y_names = ["Cp_delta", "U_x_delta", "U_y_delta", "log_nut_ratio"]
+    
+    # Process Inputs (x)
+    print("Processing Input Channels (X)...")
+    for i, name in enumerate(x_names):
+        _generate_channel_dashboard(data['x'][:, i, ...], name, "Input", save_path)
+        
+    # Process Outputs (y)
+    print("Processing Output Channels (Y)...")
+    for i, name in enumerate(y_names):
+        _generate_channel_dashboard(data['y'][:, i, ...], name, "Output", save_path)
+        
+    print(f"✅ All 16 channel distributions saved to {save_dir}/")
+
+def _generate_channel_dashboard(tensor_data, channel_name, io_type, save_path):
+    """
+    tensor_data: shape [N, Gx, Gy]
+    """
+    # 1. Compute Spatial Mean and Std Dev across N
+    spatial_mean = torch.mean(tensor_data, dim=0).cpu().numpy()
+    spatial_std = torch.std(tensor_data, dim=0).cpu().numpy()
+    
+    # 2. Extract 1D array for Histogram (subsample if dataset is massive to save RAM)
+    # Using [::10] downsamples by 10x just for the histogram calculation speed
+    flat_data = tensor_data[::10].flatten().cpu().numpy() 
+    
+    # 3. Compute Average 2D FFT Magnitude
+    # Take FFT of each sample, get magnitude, shift to center, then average across N
+    fft_vals = torch.fft.fft2(tensor_data)
+    fft_mag = torch.abs(torch.fft.fftshift(fft_vals, dim=(-2, -1)))
+    # Add small epsilon to avoid log(0)
+    mean_fft_log_mag = torch.log10(torch.mean(fft_mag, dim=0) + 1e-8).cpu().numpy()
+
+    # --- Plotting ---
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f"{io_type} Channel: {channel_name}", fontsize=18, fontweight='bold')
+    
+    # A. Spatial Mean
+    im0 = axes[0, 0].imshow(spatial_mean.T, origin='lower', cmap='viridis', aspect='auto')
+    axes[0, 0].set_title(f"Spatial Mean\nMin: {spatial_mean.min():.3f} | Max: {spatial_mean.max():.3f}")
+    fig.colorbar(im0, ax=axes[0, 0])
+    
+    # B. Spatial Std Dev
+    im1 = axes[0, 1].imshow(spatial_std.T, origin='lower', cmap='magma', aspect='auto')
+    axes[0, 1].set_title(f"Spatial Volatility (Std Dev)\nMax Volatility: {spatial_std.max():.3f}")
+    fig.colorbar(im1, ax=axes[0, 1])
+    
+    # C. 1D Value Histogram
+    axes[1, 0].hist(flat_data, bins=100, color='steelblue', edgecolor='black', alpha=0.7)
+    axes[1, 0].set_title(f"Value Distribution (Histogram)\nMean: {flat_data.mean():.3f} | Std: {flat_data.std():.3f}")
+    axes[1, 0].set_yscale('log') # Log scale helps see outliers hiding in the tails!
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # D. 2D Average FFT Magnitude
+    # Determine the center for axis labeling
+    Gx, Gy = mean_fft_log_mag.shape
+    cx, cy = Gx // 2, Gy // 2
+    extent = [-cx, cx, -cy, cy]
+    
+    im3 = axes[1, 1].imshow(mean_fft_log_mag.T, origin='lower', cmap='inferno', aspect='auto', extent=extent)
+    axes[1, 1].set_title("Average FFT Energy (Log10 Magnitude)")
+    axes[1, 1].set_xlabel("Chordwise Wavenumber ($k_\\xi$)")
+    axes[1, 1].set_ylabel("Normal Wavenumber ($k_\\eta$)")
+    fig.colorbar(im3, ax=axes[1, 1])
+
+    plt.tight_layout()
+    file_path = save_path / f"{io_type}_{channel_name}_dist.png"
+    plt.savefig(file_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
+
 
 # Define a custom dataset class that includes properties dictionary with sample information
 class TensorDatasetWithProps(Dataset):

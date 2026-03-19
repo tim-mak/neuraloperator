@@ -418,7 +418,7 @@ class AirfransDeltaTrainer(Trainer):
             # ---------------------------------------------------------
             ax1.plot(self._plot_history['epoch'], self._plot_history['train_err'], color='black', label="Total Train Err", linewidth=2)
             
-            cmap = plt.get_cmap('tab20')
+            cmap = plt.get_cmap('tab10')
             for i, k in enumerate(channel_metrics.keys()):
                 ax1.plot(self._plot_history['epoch'], self._plot_history[k], color=cmap(i), linestyle='-', label=f"Train: {k}")
                 
@@ -432,44 +432,15 @@ class AirfransDeltaTrainer(Trainer):
             # BOTTOM PANEL: Decoded Evaluation Metrics (Physical Data)
             # ---------------------------------------------------------
             eval_keys = [k for k in self._plot_history.keys() if k not in channel_metrics and k not in ['epoch', 'train_err', 'lr']]
-            # 1. Dynamically identify all unique Datasets and Metrics
-            unique_datasets = []
-            unique_metrics = []
-            for k in eval_keys:
-                if "_Weighted_" in k:
-                    ds_name, met_name = k.split("_Weighted_")
-                    if ds_name not in unique_datasets: 
-                        unique_datasets.append(ds_name)
-                    if met_name not in unique_metrics: 
-                        unique_metrics.append(met_name)    
-            # 2. Styling Pools
-            # Datasets get distinct markers and line styles
-            markers = ['o', 's', '^', 'D', 'v', 'p', '*']
-            linestyles = ['-', '--', ':', '-.']
-                                            
-            for k in eval_keys:
-                if "_Weighted_" not in k:
-                    continue 
-                    
+                        
+            for i, k in enumerate(eval_keys):
+                # Filter out the NaNs so Matplotlib connects the dots!
                 valid_epochs = [e for e, v in zip(self._plot_history['epoch'], self._plot_history[k]) if not math.isnan(v)]
                 valid_vals = [v for v in self._plot_history[k] if not math.isnan(v)]
                 
+                # Only plot if we actually have data (prevents crash on Epoch 0 if eval hasn't run yet)
                 if valid_epochs:
-                    ds_name, met_name = k.split("_Weighted_")
-                    
-                    ds_idx = unique_datasets.index(ds_name)
-                    met_idx = unique_metrics.index(met_name)
-                    
-                    marker = markers[ds_idx % len(markers)]
-                    ls = linestyles[ds_idx % len(linestyles)]
-                    
-                    # FIXED: Using tab20 and modulo 20
-                    color = cmap(met_idx % 20) 
-                    
-                    clean_metric = met_name.replace('Relative_', '').replace('Absolute_', '').replace('Physics_', '')
-                    clean_label = f"{ds_name} - {clean_metric}"
-                    
-                    ax2.plot(valid_epochs, valid_vals, color=color, linestyle=ls, marker=marker, markersize=4, label=clean_label)            
+                    ax2.plot(valid_epochs, valid_vals, color=cmap(i + len(channel_metrics)), linestyle='--', marker='o', markersize=4, label=f"Eval: {k}")
             
             ax2.grid(True, which="both", ls="--", alpha=0.5)
             ax2.set_xlabel("Epoch")
@@ -688,7 +659,7 @@ class AirfransDeltaTrainer(Trainer):
                             # 2. Y-Axis: Handle the physical reflection padding
                             m_eta_raw = self.model.n_modes[1]
                             if hasattr(self.model, 'domain_padding') and self.model.domain_padding is not None:
-                                if self.model.domain_padding.__class__.__name__ == "MirrorPaddingY":
+                                if self.model.domain_padding.__class__.__name__ == "MirrorPaddingY"  or self.model.domain_padding.__class__.__name__ == "LinearXMirrorYPadding":
                                     m_eta = m_eta_raw // 2  
                                 else:
                                     m_eta = m_eta_raw
@@ -723,6 +694,9 @@ class AirfransDeltaTrainer(Trainer):
             allocated = torch.cuda.memory_allocated(0) / (1024**3)
             peak = torch.cuda.max_memory_allocated(0) / (1024**3)
             print(f"Current VRAM: {allocated:.2f} GB | Peak VRAM: {peak:.2f} GB")
+
+
+    
 
     def plot_physical_mesh(self, loader, epoch, training_loss, save_dir="plots", sample_idx=0, prefix="prediction"):
         """Plots the physical Truth, Prediction, and Residual mapped onto the actual 2D CFD mesh."""

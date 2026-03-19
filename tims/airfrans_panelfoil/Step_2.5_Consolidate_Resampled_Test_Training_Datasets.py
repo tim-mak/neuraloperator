@@ -15,7 +15,7 @@ def consolidate_airfrans_dataset(
     xlim: float = 6.0,
     ylim: float = 3.0,
     xoffset: float = 1.0,
-    grid_sizes: list = [  (256, 64),(512, 64),( 1024, 128)]
+    grid_sizes: list = [  (256, 64),(512, 128),( 1024, 128)]
 
 ):
     """
@@ -48,7 +48,7 @@ def consolidate_airfrans_dataset(
             
             for sim_run in tqdm(sim_runs, desc=f"Loading {split_name}"):
                 sim_path = data_root 
-                data_file = sim_path / f"{sim_run}_C_mesh_{grid_size[0]}x{grid_size[1]}.pt"
+                data_file = sim_path / f"{sim_run}_C_mesh_V2_{grid_size[0]}x{grid_size[1]}.pt"
                 
                 if data_file.exists():
                     try:
@@ -85,7 +85,7 @@ def consolidate_airfrans_dataset(
                 split_type = 'train' if 'train' in split_name else 'test'
                 output_cons_dir = output_dir / split_type
                 output_cons_dir.mkdir(parents=True, exist_ok=True)
-                output_file = output_cons_dir / f"airfoil_{split_name}_CMesh_{grid_size[0]}x{grid_size[1]}.pt"
+                output_file = output_cons_dir / f"airfoil_{split_name}_CMesh_V2_{grid_size[0]}x{grid_size[1]}.pt"
                 
                 torch.save(consolidated_data, output_file)
                 print(f"  Saved {output_file} with {consolidated_x.shape[0]} samples")
@@ -97,8 +97,8 @@ def consolidate_airfrans_dataset(
 
 def main():
     # Configuration
-    data_root = Path("/home/timm/storage/AF_NO_DATASET/Archive")
-    output_dir = Path("/home/timm/storage/AF_NO_DATASET")
+    data_root = Path("/home/timm/storage/AF_NO_DATASET/Archive/C_mesh_V2")
+    output_dir = Path("/home/timm/storage/AF_NO_DATASET/C_mesh_V2")
 
     manifest_file = Path("/home/timm/Projects/PIML/Dataset/manifest.json")
     
@@ -126,7 +126,6 @@ def main():
            
         }
     
-    #grid_sizes=[(64,64),(128,128), (256,256), (512,512), (1024, 1024)]
     # Run consolidation
     consolidate_airfrans_dataset(
         data_root=data_root,
@@ -134,7 +133,7 @@ def main():
         splits_config=splits_config,
         xlim=6,
         ylim=3,
-        grid_sizes=[ (256, 32),(512, 64),( 1024, 128)]
+        grid_sizes=[ (256, 64),(512, 128),( 1024, 128)]
     )
     shutil.copy(manifest_file, Path(data_root) / "manifest.json")
     shutil.copy(manifest_file, Path(output_dir) / "manifest.json")

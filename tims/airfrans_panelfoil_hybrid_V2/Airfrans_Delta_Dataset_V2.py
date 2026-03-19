@@ -13,16 +13,11 @@ from neuralop.data.datasets.tensor_dataset import TensorDataset
 from neuralop.data.transforms.normalizers import UnitGaussianNormalizer
 from torch.utils.data import DataLoader
 from torch.utils.data.dataset import Dataset
-
-from tims.airfrans_panelfoil_linpad.Airfrans_DataProcessor_Linear_Jacobian import AirfransDataProcessor_Linear_Jacobian
-from tims.airfrans_panelfoil_linpad.Airfrans_Evaluator import AirfoilEvaluator
-from tims.airfrans_panelfoil_linpad.HybridSpectralPadder import HybridSpectralPadder 
+from tims.airfrans_panelfoil_hybrid_V2.HybridChannelWiseSpectralPadder import HybridChannelWiseSpectralPadder
+from tims.airfrans_panelfoil_hybrid_V2.Airfrans_DataProcessor_V2 import AirfransDataProcessor
+from tims.airfrans_panelfoil_hybrid_V2.Airfrans_Evaluator import AirfoilEvaluator
 from tims.airfrans_panelfoil.SelectiveUnitGaussianNormalizer import SelectiveUnitGaussianNormalizer
 from torch.utils.data._utils.collate import default_collate
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-from pathlib import Path
 
 import zencfg
 from neuralop.models.base_model import get_model
@@ -102,40 +97,6 @@ def verify_output_encoder(encoder):
 
     print(f"{'='*63}\n")
 
-def get_dataset_stats(training_file):
-    
-    print(f"--- Loading Training Split: {training_file} ---")
-    data = torch.load(training_file)
-    x = data['x']  # [N, 12, Gx, Gy]
-    y = data['y']  # [N, 4, Gx, Gy
-    # need to drop sdf channel for stats reporting since it is not used as input to the model and will not be normalized
-    x =torch.cat([x[:, :5, :, :], x[:, 6:, :, :]], dim=1) 
-
-    print(f"Getting Raw Dataset Stats from {training_file}")
-    print(f"Size of dataset {x.shape[0]} samples with input shape {x.shape} and target shape {y.shape}")
-
-
-    def print_stats(tensor, names, title):
-        print(f"\n{'='*85}")
-        print(f"{title:^85}")
-        print(f"{'='*85}")
-        print(f"{'CHANNEL':<20} | {'MEAN':<10} | {'STD':<10} | {'MIN':<10} | {'MAX':<10}")
-        print(f"{'-'*85}")
-    
-        # Calculating across Batch (0), Height (2), and Width (3)
-        # We flatten (0, 2, 3) to easily get global min/max per channel
-        for i, name in enumerate(names):
-            channel_data = tensor[:, i, :, :]
-            
-            mean = channel_data.mean().item()
-            std = channel_data.std().item()
-            c_min = channel_data.min().item()
-            c_max = channel_data.max().item()
-    
-            print(f"{name:<20} | {mean:>10.4f} | {std:>10.4f} | {c_min:>10.4f} | {c_max:>10.4f}")
-    
-    print_stats(x, input_names, "INPUT CALIBRATION (x)")
-    print_stats(y, output_names, "TARGET CALIBRATION (y)")
 
 
 def plot_dataset_distributions(data_file, save_dir="channel_distributions"):
@@ -149,25 +110,28 @@ def plot_dataset_distributions(data_file, save_dir="channel_distributions"):
     # Define your channel names mapping
     x_names = ["x", "y", "U_x_pot", "U_y_pot", "Cp_pot", "sdf", 
                "exp_sdf", "x_xi", "x_eta", "y_xi", "y_eta", "det_J"]
+    x_padder_strat = ['legendre','legendre','legendre','legendre','legendre','legendre','legendre','legendre','legendre','legendre','legendre','legendre']
+
     y_names = ["Cp_delta", "U_x_delta", "U_y_delta", "log_nut_ratio", "nutratio_cuberoot"]
-    
+    y_padder_strat = ['legendre','legendre','legendre','taper','taper']
+
     # Process Inputs (x)
     print("Processing Input Channels (X)...")
     for i, name in enumerate(x_names):
-        _generate_channel_dashboard(data['x'][:, i, ...], name, "Input", save_path)
+        _generate_channel_dashboard(data['x'][:, i, ...], name, "Input", save_path, n_additional_pts=50, padder_strat = x_padder_strat)
         
     # Process Outputs (y)
     print("Processing Output Channels (Y)...")
     for i, name in enumerate(y_names):
-        _generate_channel_dashboard(data['y'][:, i, ...], name, "Output", save_path)
+        _generate_channel_dashboard(data['y'][:, i, ...], name, "Output", save_path, n_additional_pts=50, padder_strat = y_padder_strat)
         
     print(f"✅ All 17 channel distributions saved to {save_dir}/")
 
-def _generate_channel_dashboard(tensor_data, channel_name, io_type, save_path, n_additional_pts=32):
+def _generate_channel_dashboard(tensor_data, channel_name, io_type, save_path, n_additional_pts=50,padder_strat=[]):
     
     # 1. APPLY PADDING IMMEDIATELY
     # d= 5 too high for log(nut/nu) d=2 safer
-    padder = HybridSpectralPadder(d=2, n_additional_pts=n_additional_pts).to(tensor_data.device)
+    padder = HybridChannelWiseSpectralPadder(d=2, n_additional_pts=n_additional_pts,x_axis_strategy=padder_strat).to(tensor_data.device)
     padded_data = padder(tensor_data.unsqueeze(1)).squeeze(1)
     
     # 2. Compute Spatial Mean and Std Dev ON THE PADDED DATA
@@ -231,6 +195,47 @@ def _generate_channel_dashboard(tensor_data, channel_name, io_type, save_path, n
     plt.savefig(file_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
 
+def get_dataset_stats(training_file):
+    
+    print(f"--- Loading Training Split: {training_file} ---")
+    data = torch.load(training_file)
+    x = data['x']  # [N, 12, Gx, Gy]
+    y = data['y']  # [N, 5, Gx, Gy
+    # need to drop exp (sdf) channel for stats reporting since it is not used as input to the model and will not be normalized
+    # now keeping sdf
+    x =torch.cat([x[:, :6, :, :], x[:, 7:, :, :]], dim=1) 
+    # drop lognutratio
+    y = torch.cat([y[:, :3, :, :],y[:, 4:, :,:]], dim=1)
+
+    print(f"Getting Raw Dataset Stats from {training_file}")
+    print(f"Size of dataset {x.shape[0]} samples with input shape {x.shape} and target shape {y.shape}")
+
+    # Names for your 5-Channel Input (x) and 4-Channel Target (y)
+    x_names = ["X", "Y", "U_x_pot", "U_y_pot","Cp_pot", "sdf","x_xi","x_eta","y_xi","y_eta","det_J"]
+    y_names = ["Cp_delta", "U_x_delta", "U_y_delta", "(ν_t/ν + 0.01)^(1/3)"]
+
+    def print_stats(tensor, names, title):
+        print(f"\n{'='*85}")
+        print(f"{title:^85}")
+        print(f"{'='*85}")
+        print(f"{'CHANNEL':<20} | {'MEAN':<10} | {'STD':<10} | {'MIN':<10} | {'MAX':<10}")
+        print(f"{'-'*85}")
+    
+        # Calculating across Batch (0), Height (2), and Width (3)
+        # We flatten (0, 2, 3) to easily get global min/max per channel
+        for i, name in enumerate(names):
+            channel_data = tensor[:, i, :, :]
+            
+            mean = channel_data.mean().item()
+            std = channel_data.std().item()
+            c_min = channel_data.min().item()
+            c_max = channel_data.max().item()
+    
+            print(f"{name:<20} | {mean:>10.4f} | {std:>10.4f} | {c_min:>10.4f} | {c_max:>10.4f}")
+    
+    print_stats(x, x_names, "INPUT CALIBRATION (x)")
+    print_stats(y, y_names, "TARGET CALIBRATION (y)")
+
 # Define a custom dataset class that includes properties dictionary with sample information
 class TensorDatasetWithProps(Dataset):
     def __init__(self, x, y, props, transform_x=None, transform_y=None):
@@ -258,7 +263,7 @@ class TensorDatasetWithProps(Dataset):
         return self.x.size(0)
     
 
-class AirfransDataset(PTDataset):
+class AirfransDatasetV2(PTDataset):
     def __init__(
         self,
         data_dir: Union[Path, str],
@@ -267,8 +272,8 @@ class AirfransDataset(PTDataset):
         test_splits: List[str] = ['full_test','aoa_test'],
         batch_size: int = 16,
         test_batch_sizes: List[int] = [32, 32],
-        train_resolution: tuple = (256,32),
-        test_resolutions: List[tuple] = [(256,32),(512,64)],
+        train_resolution: tuple = (256,64),
+        test_resolutions: List[tuple] = [(256,64),(512,128)],
         xlim: float = 6.0,
         ylim: float = 3.0,
         encode_input: bool = True,   # normalize u,v,sdf,log_nu but NOT mask
@@ -320,7 +325,7 @@ class AirfransDataset(PTDataset):
         self.test_batch_sizes = test_batch_sizes
         
         # Load training data with custom filename
-        train_file = data_dir / "train"/ f"{dataset_name}_{train_split}_CMesh_{train_resolution[0]}x{train_resolution[1]}.pt"
+        train_file = data_dir / "train"/ f"{dataset_name}_{train_split}_CMesh_V2_{train_resolution[0]}x{train_resolution[1]}.pt"
         train_data = torch.load(train_file.as_posix(),weights_only=False)
         
         x_train =train_data["x"]
@@ -330,8 +335,8 @@ class AirfransDataset(PTDataset):
         # 2  = U_x_pot
         # 3  = U_y_pot
         # 4  = Cp_pot
-        # 5  = sdf    # To be dropped
-        # 6  = exp_sdf
+        # 5  = sdf    
+        # 6  = exp_sdf  # To be dropped
         # 7  = x_xi  => 6
         # 8  = x_eta => 7
         # 9  = y_xi => 8
@@ -342,10 +347,11 @@ class AirfransDataset(PTDataset):
         # 0 = Cp_delta
         # 1 = U_x_delta
         # 2 = U_y_delta
-        # 3 = log_nut_ratio
+        # 3 = log_nut_ratio   # To be dropped
+        # 4 = nutratio_cubed
 
-        # drop the sdf channel
-        x_train = torch.cat([x_train[:, :5, :, :], x_train[:, 6:, :, :]], dim=1) 
+        # drop the exp(sdf) channel
+        x_train = torch.cat([x_train[:, :6, :, :], x_train[:, 7:, :, :]], dim=1) 
         # modify the input channels to be in a reasonable range before normalization 
         ##x_train[:,7:9, :, :] = torch.arcsinh(x_train[:, 7:9, :, :] ) 
         # modify jacobian channel to log(det_J) to keep values in a reasonable range for normalization
@@ -353,8 +359,9 @@ class AirfransDataset(PTDataset):
 
         y_train = train_data["y"].clone()
 
-        y_train = y_train[:, :, :, :]  # keep all channels
-
+        #y_train = y_train[:, :, :, :]  # keep all channels
+        # dropping log(nutratio) 
+        y_train = torch.cat([y_train[:, :3, :, :], y_train[:, 4:, :, :]], dim=1) 
         # ... loading x_train, y_train ...
 
         if 'props' not in train_data:
@@ -437,7 +444,7 @@ class AirfransDataset(PTDataset):
 
         
         # Create custom data processor that handles selective input normalization
-        self._data_processor = AirfransDataProcessor_Linear_Jacobian(
+        self._data_processor = AirfransDataProcessor(
             in_normalizer=input_encoder, 
             out_normalizer=output_encoder,
             xi_pad_frac=0.1
@@ -448,20 +455,18 @@ class AirfransDataset(PTDataset):
         for (res_xi,res_eta), n_test, test_split in zip(test_resolutions, n_tests, test_splits):
             print(f"Loading test db for {test_split} resolution {res_xi}x{res_eta} with {n_test} samples")
             
-            test_file = data_dir / "test" / f"{dataset_name}_{test_split}_CMesh_{res_xi}x{res_eta}.pt"
+            test_file = data_dir / "test" / f"{dataset_name}_{test_split}_CMesh_V2_{res_xi}x{res_eta}.pt"
             test_data = torch.load(test_file.as_posix())
             
             x_test = test_data["x"].type(torch.float32).clone()
 
-            # drop the sdf channel
-            x_test = torch.cat([x_test[:, :5, :, :], x_test[:, 6:, :, :]], dim=1) 
-            # modify the input channels to be in a reasonable range before normalization 
-            #x_test[:,7:9, :, :] = torch.arcsinh(x_test[:, 7:9, :, :] ) 
-            # modify jacobian channel to log(det_J) to keep values in a reasonable range for normalization
-            #x_test[:, 10, :, :] = torch.log(x_test[:, 10, :, :] + 1e-8)
+            # drop the exp(sdf) channel
+            x_test = torch.cat([x_test[:, :6, :, :], x_test[:, 7:, :, :]], dim=1) 
 
             y_test = test_data["y"].clone()
-            y_test = y_test[:, :, :, :]  # keep all channels
+            #y_test = y_test[:, :, :, :]  # keep all channels
+            y_test = torch.cat([y_test[:, :3, :, :], y_test[:, 4:, :, :]], dim=1) 
+
 
             props = test_data.get('props', None)
             # add empty props if none found
@@ -486,8 +491,8 @@ def load_airfrans_dataset(
     test_splits,
     batch_size,
     test_batch_sizes,
-    train_resolution=(256,32),
-    test_resolutions=[(128,32), (256,32)],
+    train_resolution=(256,64),
+    test_resolutions=[(256,64), (512,128)],
     encode_input=True,
     encode_output=True,
     encoding="channel-wise",
@@ -496,7 +501,7 @@ def load_airfrans_dataset(
     
     collate_with_props_fn = collate_batch_with_props
 
-    dataset = AirfransDataset(
+    dataset = AirfransDatasetV2(
         data_dir=data_dir,
         dataset_name=dataset_name,
         train_split=train_split,

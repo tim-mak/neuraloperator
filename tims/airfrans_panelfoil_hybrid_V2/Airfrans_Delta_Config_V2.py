@@ -2,7 +2,7 @@ from typing import Any, List, Optional
 
 from zencfg import ConfigBase
 from config.distributed import DistributedConfig
-from config.models import FNOConfig, ModelConfig, FNO_Small2d
+from config.models import FNOConfig, ModelConfig
 from config.opt import OptimizationConfig, PatchingConfig
 from config.wandb import WandbConfig
 
@@ -45,7 +45,7 @@ class Default(ConfigBase):
     model: ModelConfig = FNOConfig(
         data_channels=11,    #  names =[ "X", "Y", "U_x", "U_y", "Cp_pot", "exp_sdf","x_xi","x_eta","y_xi","y_eta","det_J"]
         out_channels=4,     # [delta_Cp, delta_U_x, delta_U_y, log_nut_ratio]
-        n_modes=[128,64],   #  ( 64 real modes in X and 16 in Y after mirror) says  X direction is full complex fft needs 2N real modes # mirror padding means double the modes in Y direction to account for the padding (256,32) -> (256,64)
+        n_modes=[128,64],   #  ( 64 real modes in X and 32 in Y after mirror) says  X direction is full complex fft needs 2N real modes # mirror padding means double the modes in Y direction to account for the padding (256,64) -> (256,128)
         hidden_channels=32,
         lifting_channel_ratio=2,
         projection_channel_ratio=2,

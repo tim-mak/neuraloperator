@@ -13,11 +13,11 @@ from neuralop import H1Loss, LpLoss, Trainer, get_model
 from neuralop.training import setup, AdamW
 from neuralop.mpu.comm import get_local_rank
 from neuralop.utils import get_wandb_api_key, count_model_params    
-from tims.airfrans_panelfoil_linpad.LinearXMirrorYPadding import LinearXMirrorYPadding
-from tims.airfrans_panelfoil_linpad.WeightedFieldwiseAggregatorLoss import WeightedFieldwiseAggregatorLoss
-from tims.airfrans_panelfoil_linpad.Airfrans_Delta_Linear_Jacobian_Dataset import load_airfrans_dataset, get_dataset_stats, verify_input_encoder, verify_output_encoder, plot_dataset_distributions
-from tims.airfrans_panelfoil_linpad.Airfrans_Delta_Config_Weight_Sob_Mirror_Y import Default
-from tims.airfrans_panelfoil_linpad.Airfrans_Delta_Trainer import AirfransDeltaTrainer
+from tims.airfrans_panelfoil_hybrid_V2.HybridChannelWiseSpectralPadder import HybridChannelWiseSpectralPadder
+from tims.airfrans_panelfoil_hybrid_V2.WeightedFieldwiseAggregatorLoss import WeightedFieldwiseAggregatorLoss
+from tims.airfrans_panelfoil_hybrid_V2.Airfrans_Delta_Dataset_V2 import load_airfrans_dataset, get_dataset_stats, verify_input_encoder, verify_output_encoder, plot_dataset_distributions
+from tims.airfrans_panelfoil_hybrid_V2.Airfrans_Delta_Config_V2 import Default
+from tims.airfrans_panelfoil_hybrid_V2.Airfrans_Delta_Trainer import AirfransDeltaTrainer
 from tims.airfrans_panelfoil_linpad.fnoCustomPadding import FNOCustomPadding
 from tims.airfrans_panelfoil_pad_linear.SobolevLoss import SobolevLoss
 
@@ -128,9 +128,8 @@ train_loader, test_loaders, data_processor = load_airfrans_dataset(
 # check dataset stats
 print(" =" * 80)
 print("\nDataset Statistics Audit:")
-get_dataset_stats(Path(config.data.data_dir) / "train" / f"{config.data.dataset_name}_{config.data.train_split}_CMesh_{config.data.train_resolution[0]}x{config.data.train_resolution[1]}.pt")
+get_dataset_stats(Path(config.data.data_dir) / "train" / f"{config.data.dataset_name}_{config.data.train_split}_CMesh_V2_{config.data.train_resolution[0]}x{config.data.train_resolution[1]}.pt")
 
-plot_dataset_distributions(Path(config.data.data_dir) / "train" / f"{config.data.dataset_name}_{config.data.train_split}_CMesh_{config.data.train_resolution[0]}x{config.data.train_resolution[1]}.pt")
 
 # check data_processor
 print(" =" * 80)
@@ -144,7 +143,7 @@ loss_mappings = {
     'Cp_delta': 0,
     'U_x_delta': 1,
     'U_y_delta': 2,
-    'log_nutratio': 3
+    'nutratio_cuberoot': 3
 }
 
 # 2. The Specific Loss Algorithms
@@ -152,7 +151,7 @@ loss_functions = {
     'Cp_delta': SobolevLoss(l2_weight=0.5),   # 2D spatial domain, L2 norm
     'U_x_delta': SobolevLoss(l2_weight=0.5),
     'U_y_delta': SobolevLoss(l2_weight=0.5),
-    'log_nutratio': SobolevLoss(l2_weight=0.5)         # Standard point-wise mean squared error
+    'nutratio_cuberoot': SobolevLoss(l2_weight=0.5)         # Standard point-wise mean squared error
 }
 
 print(f"Weights for Weighted Loss: {config.data.weights}")
@@ -163,7 +162,7 @@ loss_weights = {
     'Cp_delta': config.data.weights[0],  # e.g., 1.0
     'U_x_delta': config.data.weights[1],
     'U_y_delta': config.data.weights[2],
-    'log_nutratio': config.data.weights[3],
+    'nutratio_cuberoot': config.data.weights[3],
 }
 
 # Instantiate the final loss object
@@ -180,7 +179,7 @@ mae_functions = {
     'Cp_delta': nn.L1Loss(),
     'U_x_delta': nn.L1Loss(),
     'U_y_delta': nn.L1Loss(),
-    'log_nutratio': nn.L1Loss()
+    'nutratio_cuberoot': nn.L1Loss()
 }
 
 # H1 Loss measures the error of the values AND their spatial gradients (shear/vorticity)
@@ -188,7 +187,7 @@ h1_functions = {
     'Cp_delta': H1Loss(d=2),
     'U_x_delta': H1Loss(d=2),
     'U_y_delta': H1Loss(d=2),
-    'log_nutratio': H1Loss(d=2) # Or leave as MSE if H1 is too heavy for turbulence
+    'nutratio_cuberoot': H1Loss(d=2) # Or leave as MSE if H1 is too heavy for turbulence
 }
 
 
@@ -209,13 +208,15 @@ eval_h1_loss_object = WeightedFieldwiseAggregatorLoss( h1_functions,
                                                      logging_enabled=False)
 
 
-eval_losses = {"Weighted_Relative_Lp2": eval_lp_loss_object,
-               "Weighted_Absolute_MAE" : eval_mae_loss_object,
-               "Weighted_Physics_H1" : eval_h1_loss_object}
+eval_losses = {"Wtd_Relative_Lp2": eval_lp_loss_object,
+               "Wtd_Absolute_MAE" : eval_mae_loss_object,
+               "Wtd_Physics_H1" : eval_h1_loss_object}
 
 
 # Model initialization
 #model = get_model(config)
+x_padder_strat = ['legendre','legendre','legendre','legendre','legendre','legendre','legendre','legendre','legendre','legendre','legendre','legendre']
+
 
 model = FNOCustomPadding(
     n_modes=config.model.n_modes,
@@ -228,7 +229,7 @@ model = FNOCustomPadding(
     use_channel_mlp=config.model.use_channel_mlp,
     channel_mlp_expansion=config.model.channel_mlp_expansion,
     stabilizer=None,
-    domain_padding=LinearXMirrorYPadding(padding_x=6),
+    domain_padding=HybridChannelWiseSpectralPadder(d=2, n_additional_pts = 50, x_axis_strategy = x_padder_strat ),
 )
 
 
