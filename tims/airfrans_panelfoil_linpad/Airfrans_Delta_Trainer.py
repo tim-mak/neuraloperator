@@ -659,7 +659,7 @@ class AirfransDeltaTrainer(Trainer):
                             # 2. Y-Axis: Handle the physical reflection padding
                             m_eta_raw = self.model.n_modes[1]
                             if hasattr(self.model, 'domain_padding') and self.model.domain_padding is not None:
-                                if self.model.domain_padding.__class__.__name__ == "MirrorPaddingY":
+                                if self.model.domain_padding.__class__.__name__ == "MirrorPaddingY"  or self.model.domain_padding.__class__.__name__ == "LinearXMirrorYPadding":
                                     m_eta = m_eta_raw // 2  
                                 else:
                                     m_eta = m_eta_raw
@@ -694,6 +694,9 @@ class AirfransDeltaTrainer(Trainer):
             allocated = torch.cuda.memory_allocated(0) / (1024**3)
             peak = torch.cuda.max_memory_allocated(0) / (1024**3)
             print(f"Current VRAM: {allocated:.2f} GB | Peak VRAM: {peak:.2f} GB")
+
+
+    
 
     def plot_physical_mesh(self, loader, epoch, training_loss, save_dir="plots", sample_idx=0, prefix="prediction"):
         """Plots the physical Truth, Prediction, and Residual mapped onto the actual 2D CFD mesh."""

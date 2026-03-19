@@ -14,8 +14,8 @@ from neuralop.data.transforms.normalizers import UnitGaussianNormalizer
 from torch.utils.data import DataLoader
 from torch.utils.data.dataset import Dataset
 
-from tims.airfrans_panelfoil_pad_linear.Airfrans_DataProcessor_Linear_Jacobian import AirfransDataProcessor_Linear_Jacobian
-from tims.airfrans_panelfoil_pad_linear.Airfrans_Evaluator import AirfoilEvaluator
+from tims.airfrans_panelfoil_linpad.Airfrans_DataProcessor_Linear_Jacobian import AirfransDataProcessor_Linear_Jacobian
+from tims.airfrans_panelfoil_linpad.Airfrans_Evaluator import AirfoilEvaluator
 from tims.airfrans_panelfoil.SelectiveUnitGaussianNormalizer import SelectiveUnitGaussianNormalizer
 from torch.utils.data._utils.collate import default_collate
 

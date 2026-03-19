@@ -1,6 +1,6 @@
 from networkx import config
 
-from tims.airfrans_panelfoil_pad_linear.Airfrans_Evaluator import AirfoilEvaluator
+from tims.airfrans_panelfoil_linpad.Airfrans_Evaluator import AirfoilEvaluator
 from neuralop.training.trainer import Trainer
 from typing import Union
 from pathlib import Path
@@ -188,16 +188,11 @@ class AirfransDeltaTrainer(Trainer):
                 # Plot diagnostic sample using training loader         
                 
                 self.plot_diagnostic_grid(train_loader, epoch, save_dir=save_dir, prefix="Train", sample_idx=sample_idx, training_loss=training_loss)
-                self.plot_physical_mesh(train_loader, epoch,  training_loss=training_loss, save_dir=save_dir, prefix="Train", sample_idx=sample_idx)
-                self.plot_pure_fourier_features(train_loader, epoch, save_dir=save_dir, sample_idx=sample_idx, prefix="fourier_train")
-
                 # Plot diagnostic sample using test loader
                 # make sure sample_idx is valid for test loader, otherwise it will error out. You can set it to 0 to always plot the first sample in the test set.
                 for test_name, test_loader in test_loaders.items():
-                    # should this use eval_losses or training_loss? For now we will use training_loss to be consistent with the diagnostic grid, but it could be interesting to use the specific eval loss for that test set if it's different from the training loss.
                     self.plot_diagnostic_grid(test_loader, epoch, save_dir=save_dir, prefix=test_name, sample_idx=sample_idx, training_loss=training_loss)
-                    self.plot_physical_mesh(test_loader, epoch, save_dir=save_dir, prefix=test_name, sample_idx=sample_idx, training_loss=training_loss)
-            
+
             if self.verbose:
                 self.log_training(
                     epoch=epoch,
@@ -418,7 +413,7 @@ class AirfransDeltaTrainer(Trainer):
             # ---------------------------------------------------------
             ax1.plot(self._plot_history['epoch'], self._plot_history['train_err'], color='black', label="Total Train Err", linewidth=2)
             
-            cmap = plt.get_cmap('tab10')
+            cmap = plt.get_cmap('tab20')
             for i, k in enumerate(channel_metrics.keys()):
                 ax1.plot(self._plot_history['epoch'], self._plot_history[k], color=cmap(i), linestyle='-', label=f"Train: {k}")
                 
@@ -440,14 +435,23 @@ class AirfransDeltaTrainer(Trainer):
                 
                 # Only plot if we actually have data (prevents crash on Epoch 0 if eval hasn't run yet)
                 if valid_epochs:
-                    ax2.plot(valid_epochs, valid_vals, color=cmap(i + len(channel_metrics)), linestyle='--', marker='o', markersize=4, label=f"Eval: {k}")
+                    # Assign distinct markers and line styles based on the dataset
+                    marker = 'o' if 'Train' in k else ('s' if '256' in k else '^')
+                    ls = '-' if 'Train' in k else '--'
+                    
+                    # Clean up the label so it doesn't take up the whole screen
+                    clean_label = k.replace('TrainData_Eval_Weighted_', 'Train ').replace('_Weighted', '')
+                    
+                    ax2.plot(valid_epochs, valid_vals, color=cmap(i), linestyle=ls, marker=marker, markersize=4, label=clean_label)      
             
             ax2.grid(True, which="both", ls="--", alpha=0.5)
             ax2.set_xlabel("Epoch")
             ax2.set_ylabel("Decoded Physical Error")
             ax2.set_yscale('log')  
             ax2.set_title('Physical Evaluation Metrics')
-            ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+            
+            # Shrink the font slightly and put it outside the box
+            ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small')
 
             plt.tight_layout() 
             
@@ -694,192 +698,6 @@ class AirfransDeltaTrainer(Trainer):
             allocated = torch.cuda.memory_allocated(0) / (1024**3)
             peak = torch.cuda.max_memory_allocated(0) / (1024**3)
             print(f"Current VRAM: {allocated:.2f} GB | Peak VRAM: {peak:.2f} GB")
-
-    def plot_physical_mesh(self, loader, epoch, training_loss, save_dir="plots", sample_idx=0, prefix="prediction"):
-        """Plots the physical Truth, Prediction, and Residual mapped onto the actual 2D CFD mesh."""
-        
-        # 1. DDP Safety Guard
-        if self.use_distributed and torch.distributed.is_initialized():
-            if torch.distributed.get_rank() != 0:
-                return
-
-        self.model.eval()
-        if self.data_processor:
-            self.data_processor.eval()
-        
-        batch = next(iter(loader))
-        
-        target_losses = training_loss.losses
-        target_weights = training_loss.weights   
-        
-        with torch.no_grad():
-            x_raw = batch['x'][sample_idx:sample_idx+1].to(self.device)
-            y_raw = batch['y'][sample_idx:sample_idx+1].to(self.device)
-            
-            sample = self.data_processor.preprocess({'x': x_raw, 'y': y_raw})
-            x_input = sample['x'].to(self.device)
-
-            # Forward pass & Decode
-            y_norm_pred = self.model(x_input)
-            y_phys_pred, _ = self.data_processor.postprocess(y_norm_pred, sample)
-
-            if isinstance(y_phys_pred, dict):
-                y_phys_pred = y_phys_pred['y']
-
-        # 2. Extract Data to CPU Numpy Arrays
-        # User specified: Input Channel 0 = X coords, Channel 1 = Y coords
-        grid_x = x_raw[0, 0, ...].cpu().numpy()
-        grid_y = x_raw[0, 1, ...].cpu().numpy()
-        
-        truth = y_raw[0, ...].cpu().numpy()
-        pred = y_phys_pred[0, ...].cpu().numpy()
-        residual = truth - pred
-        
-        channel_names = list(target_losses.keys())
-        num_channels = len(channel_names)
-        
-        # 3. Setup the Figure (Rows = Channels, Cols = Truth, Pred, Residual)
-        import matplotlib.pyplot as plt
-        import numpy as np
-        
-        fig, axes = plt.subplots(num_channels, 3, figsize=(18, 4 * num_channels), constrained_layout=True)
-        # Handle the edge case of 1 channel (axes is 1D instead of 2D)
-        if num_channels == 1:
-            axes = np.expand_dims(axes, axis=0)
-            
-        fig.suptitle(f"[{prefix}] Physical Mesh Projection - Epoch {epoch}", fontsize=16, fontweight='bold')
-        
-        n_out = y_raw.shape[1]
-
-        if n_out == 4:
-            n_labels = ['Delta C_p', 'Delta U_x', 'Delta U_y', 'log_10(nu_t/nu)']
-            output_cmap_ranges = [(truth[:, i].min(), truth[:, i].max()) for i in range(n_out)]
-            residual_cmap_ranges = [0.01, 0.01, 0.01, 4.0]
-        else:
-            n_labels = [f'Channel {i}' for i in range(n_out)]
-            residual_cmap_ranges = [0.05] * n_out
-
-
-        # 4. Plotting Loop
-        for i, field_name in enumerate(channel_names):
-            c_truth = truth[i]
-            c_pred = pred[i]
-            c_resid = residual[i]
-            c_min, c_max = y_raw[0, i].min().item(), y_raw[0, i].max().item()
-
-
-            
-            # Column 0: Ground Truth
-            vmin, vmax = output_cmap_ranges[i]
-            im0 = axes[i, 0].pcolormesh(grid_x, grid_y, c_truth, cmap='viridis', shading='auto', vmin=c_min, vmax=c_max)
-            axes[i, 0].set_title(f"{field_name} (Truth)")
-            fig.colorbar(im0, ax=axes[i, 0], fraction=0.046, pad=0.04)
-            
-            # Column 1: Prediction
-            im1 = axes[i, 1].pcolormesh(grid_x, grid_y, c_pred, cmap='viridis', shading='auto', vmin=c_min, vmax=c_max)
-            axes[i, 1].set_title(f"{field_name} (Prediction)")
-            fig.colorbar(im1, ax=axes[i, 1], fraction=0.046, pad=0.04)
-            
-            # Column 2: Residual (Truth - Pred)
-            im2 = axes[i, 2].pcolormesh(grid_x, grid_y, c_resid, cmap='coolwarm', shading='auto', vmin=-residual_cmap_ranges[i], vmax=residual_cmap_ranges[i])
-            axes[i, 2].set_title(f"{field_name} (Residual)")
-            fig.colorbar(im2, ax=axes[i, 2], fraction=0.046, pad=0.04)
-
-            # Formatting for all subplots in this row
-            for j in range(3):
-                axes[i, j].set_aspect('equal') # Keeps the airfoil physically proportioned
-                axes[i, j].set_xlabel("X (m)")
-                axes[i, j].set_ylabel("Y (m)")
-                
-                # Optional: Zoom in on the airfoil (uncomment to restrict field of view)
-                axes[i, j].set_xlim([-1.5, 2.5])
-                axes[i, j].set_ylim([-1.5, 1.5])
-
-        # 5. Save and Close
-        mesh_save_dir = save_dir / f"mesh_plots_{prefix}"
-        mesh_save_dir.mkdir(parents=True, exist_ok=True)
-        file_path = mesh_save_dir / f"mesh_sample_{prefix}_{sample_idx}_epoch_{epoch}.png"
-        
-        plt.savefig(file_path, dpi=200, bbox_inches='tight', facecolor="white")
-        plt.close(fig)
-
-    def plot_pure_fourier_features(self, loader, epoch, save_dir="plots", sample_idx=0, prefix="prediction"):
-        """Hooks the final inverse FFT output and plots it as a rectangular computational grid."""
-        
-        # 1. DDP Safety Guard
-        if self.use_distributed and torch.distributed.is_initialized():
-            if torch.distributed.get_rank() != 0:
-                return
-
-        self.model.eval()
-        if self.data_processor:
-            self.data_processor.eval()
-
-        # 2. Find the last Spectral Convolution layer
-        spectral_layers = [m for m in self.model.modules() if 'SpectralConv' in type(m).__name__]
-        if not spectral_layers:
-            return
-        last_spectral_layer = spectral_layers[-1]
-
-        # 3. Setup the Wiretap
-        ifft_output = {}
-        def hook_fn(module, input, output):
-            ifft_output['flowy_tensor'] = output.detach().clone()
-            
-        handle = last_spectral_layer.register_forward_hook(hook_fn)
-
-        # 4. Forward Pass
-        batch = next(iter(loader))
-        with torch.no_grad():
-            x_raw = batch['x'][sample_idx:sample_idx+1].to(self.device)
-            y_raw = batch['y'][sample_idx:sample_idx+1].to(self.device)
-            sample = self.data_processor.preprocess({'x': x_raw, 'y': y_raw})
-            
-            _ = self.model(sample['x'].to(self.device))
-            
-        handle.remove()
-
-        # 5. Extract Data & UNPAD
-        flowy_tensor = ifft_output['flowy_tensor']
-        
-        # Strip away the mirror and linear bridge padding!
-        if hasattr(self.model, 'domain_padding') and self.model.domain_padding is not None:
-            flowy_tensor = self.model.domain_padding.unpad(flowy_tensor)
-
-        flowy_data = flowy_tensor[0].cpu().numpy()
-
-        # 6. Plotting the Rectangular Matrix
-        import matplotlib.pyplot as plt
-        import numpy as np
-        
-        num_plots = min(3, flowy_data.shape[0])
-        fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 5), constrained_layout=True)
-        if num_plots == 1: axes = [axes]
-        
-        fig.suptitle(f"[{prefix}] Latent Computational Domain - Epoch {epoch}", fontsize=16, fontweight='bold', color='teal')
-
-        for i in range(num_plots):
-            c_data = flowy_data[i]
-            
-            # imshow maps the matrix directly to pixels. 
-            # We transpose (.T) so X is horizontal and Y is vertical.
-            # aspect='auto' lets the rectangle stretch to fit the figure nicely.
-            im = axes[i].imshow(c_data.T, origin='lower', cmap='twilight_shifted', aspect='auto')
-            
-            axes[i].set_title(f"Latent Wave Channel {i}", fontsize=12)
-            fig.colorbar(im, ax=axes[i], fraction=0.046, pad=0.04)
-            
-            axes[i].set_xlabel("Computational X Index (Chordwise)")
-            if i == 0: 
-                axes[i].set_ylabel("Computational Y Index (Normal)")
-
-        # 7. Save
-        out_dir = save_dir / f"fourier_features_{prefix}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        file_path = out_dir / f"{prefix}_flowy_features_sample_{sample_idx}_epoch_{epoch:04d}.png"
-        
-        plt.savefig(file_path, dpi=200, bbox_inches='tight', facecolor="white")
-        plt.close(fig)    
 
     def _register_fft_hook(self):
             storage = {}
