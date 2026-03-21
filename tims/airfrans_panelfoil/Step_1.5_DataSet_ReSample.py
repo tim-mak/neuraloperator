@@ -59,11 +59,14 @@ def get_cmesh(SIM_PATH, VTM_PATH, FOAM_PATH, I0_min, J_MAX, output_type='vts'):
 
     # need only first 158 points in j direction to cover cartesian domain used in Airfrans data
     # extract_subset takes a single flat extent: [i_min, i_max, j_min, j_max, k_min, k_max]
+    # Changing J_Max to full 218 to make down striding simpler
     #J_MAX = 158
     #I0_min = 58
     # extract subgrids with correct i extents, keeping all j points up to J_MAX
     subgrids_raw = []
     num_wake_cells = 0
+    le_index = 0  # Initialize
+    cumulative_i =0
     for bname in BLOCK_ORDER:
         grid = grid_by_name[bname]
         ni, nj, nk = grid.dimensions
@@ -74,10 +77,23 @@ def get_cmesh(SIM_PATH, VTM_PATH, FOAM_PATH, I0_min, J_MAX, output_type='vts'):
             sub = grid.extract_subset([I0_min, ni - 1, 0, min(J_MAX, nj - 1), 0, 1])
         else:
             sub = grid.extract_subset([0, ni - 1, 0, min(J_MAX, nj - 1), 0, 1])
-        subgrids_raw.append((bname, sub))
-        print(f"'{bname}': {grid.dimensions} → {sub.dimensions}  "
-              f"pts={sub.n_points}  cells={sub.n_cells}")
+        
+        sub_ni = sub.dimensions[0]
 
+        # Find LE index from last node in block5
+        if bname == 'block_5':
+            # We subtract the overlaps accumulated so far (block 0-3 and 3-5)
+            # cumulative_i is the start of block_5. 
+            # Adding (sub_ni - 1) gives the last index of block_5.
+            le_index = cumulative_i + (sub_ni - 1)
+        # Update cumulative counter. 
+        # subtract 1 because the last node of this block 
+        # is the first node of the next block.        
+        cumulative_i += (sub_ni - 1)   
+        subgrids_raw.append((bname, sub))
+        print(f"{bname}: {grid.dimensions} → {sub.dimensions}  pts={sub.n_points}  cells={sub.n_cells}")
+
+    print(f"\n Leading Edge Index: {le_index}")
     print("\nChain-stitching i-axis orientations:")
     subgrids = chain_stitch_orientation(subgrids_raw)
 
@@ -144,7 +160,7 @@ def get_cmesh(SIM_PATH, VTM_PATH, FOAM_PATH, I0_min, J_MAX, output_type='vts'):
             f"point_data={list(merged.point_data.keys())}")
     
 
-    return merged, num_wake_cells
+    return merged, num_wake_cells, le_index
 
 def cell_centers(X, Y):
     """Return cell-centre coordinates for a structured grid.
@@ -470,7 +486,7 @@ def process_airfrans_calc_potentialflow(name, AF_ROOT, OF_ROOT, STORAGE_DIR, I0_
 
         #I0_min = 56
         #J_MAX = 158 # 158 
-        cmesh, num_wake_cells = get_cmesh(SIM_PATH, VTM_PATH, FOAM_PATH, I0_min, J_MAX, output_type='vts')
+        cmesh, num_wake_cells, le_index = get_cmesh(SIM_PATH, VTM_PATH, FOAM_PATH, I0_min, J_MAX, output_type='vts')
         print(f"Extracted C-mesh: type={type(cmesh).__name__}  pts={cmesh.n_points}  cells={cmesh.n_cells}  "
                 f"cell_data={list(cmesh.cell_data.keys())}  point_data={list(cmesh.point_data.keys())}")
         nx, ny, nz = cmesh.dimensions
@@ -578,8 +594,9 @@ def process_airfrans_calc_potentialflow(name, AF_ROOT, OF_ROOT, STORAGE_DIR, I0_
         cmesh.cell_data['Cp_delta'] = cmesh.cell_data['Cp'] - cmesh.cell_data['Cp_pot']
         cmesh.cell_data['U_x_delta'] = cmesh.cell_data['U_x'] - cmesh.cell_data['U_x_pot']
         cmesh.cell_data['U_y_delta'] = cmesh.cell_data['U_y'] - cmesh.cell_data['U_y_pot'] 
-        cmesh.cell_data['log_nut_ratio'] =  np.log10(np.clip(cmesh.cell_data['nut'], 1e-12, None) / nu)  # take log(nut/nu) to compress range for ML training
         
+        cmesh.cell_data['log_nut_ratio'] =  np.log10(np.clip(cmesh.cell_data['nut'], 1e-12, None) / nu)  # take log(nut/nu) to compress range for ML training
+        cmesh.cell_data['nut_ratio_cuberoot'] = np.power(np.clip(cmesh.cell_data['nut'],1e-12,None), (1/3))
         # interpolate cell Cp to points for better visualization and to match input features which are point-based
         nodal_mesh = cmesh.cell_data_to_point_data()
 
@@ -601,6 +618,7 @@ def process_airfrans_calc_potentialflow(name, AF_ROOT, OF_ROOT, STORAGE_DIR, I0_
         cmesh.point_data['U_y_delta'] = nodal_mesh['U_y_delta']
         cmesh.point_data['nut'] = nodal_mesh['nut']
         cmesh.point_data['log_nut_ratio'] = nodal_mesh['log_nut_ratio']  
+        cmsh
         cmesh.point_data['wallShearStress_x'] = nodal_mesh['wallShearStress'][:, 0]
         cmesh.point_data['wallShearStress_y'] = nodal_mesh['wallShearStress'][:, 1]
 
@@ -672,7 +690,8 @@ def process_airfrans_calc_potentialflow(name, AF_ROOT, OF_ROOT, STORAGE_DIR, I0_
         y_delta_tensor = torch.tensor(y_delta, dtype=torch.float32)
         y_out_tensor = torch.tensor(y_out, dtype=torch.float32)
 
-        # reshape x_data to (Channels, 1182, 159) for PyTorch convention (C, H, W)
+        # reshape x_data to (Channels, 1182, 164) for PyTorch convention (C, H, W)  taking  now 164 in j direction so that down striding is simpler
+        # number of i dimension varies between samples
         x_data_spatial = x_tensor.view(n_eta, n_xi, 12).permute(2, 1, 0)
         y_delta_spatial = y_delta_tensor.view(n_eta, n_xi, 4).permute(2, 1, 0)
         y_out_spatial = y_out_tensor.view(n_eta, n_xi, 6).permute(2, 1, 0)
@@ -815,23 +834,29 @@ def resample_airfrans(STORAGE_DIR, resolutions=[(256,64), (512,128), (1024,128)]
             y_delta_spatial = archive_dict['y_delta']
             y_out_spatial = archive_dict['y_out']
             props = archive_dict['props']
+            # Add log(Rn) channel as a constant feature across the spatial grid since it's a global property of the flow that can help the model learn scaling laws
+            log_reynolds = props['log_reynolds'].item()
             # Modify some features
             # SDF channel = 5  
             # exp(SDF) = 6
             # Add (nut/nu  + eps)^(1/3) 
             nu = props['nu_mol'].item()
-            eps_nu = 0.01
+            eps_nu = 1e-12
             nut_ratio = y_out_spatial[3:4, :, :] / nu + eps_nu
-            nutratio_cuberoot = torch.pow(nut_ratio, 1/3)      
+            nutratio_cuberoot = torch.pow(nut_ratio, 1/3)   
+            log_reynolds_channel = torch.full_like(nutratio_cuberoot, log_reynolds)
             # 2. Concatenate to your existing 4-channel y_delta
-            # y_delta: [ 4, X, Y] -> y_delta_extended: [5, X, Y]
+            # y_delta: [ 4, X, Y] -> y_delta_extended: [6, X, Y]
+            x_data_extended = torch.cat([x_data_spatial,log_reynolds_channel],dim=0)
             y_delta_extended = torch.cat([y_delta_spatial, nutratio_cuberoot], dim=0)
+
+            # Crop to 1024:128 for constant size high resol
 
             for ni_new, nj_new in resolutions:
                 # 1. Interpolate (ensure 4D input: [Batch, Channel, H, W])
                 # Mode 'bilinear' with align_corners=True preserves the wall (j=0) perfectly
 
-                x_batch = x_data_spatial.unsqueeze(0)
+                x_batch = x_data_extended.unsqueeze(0)
                 x_resampled = F.interpolate(
                     x_batch, 
                     size=(ni_new, nj_new), 

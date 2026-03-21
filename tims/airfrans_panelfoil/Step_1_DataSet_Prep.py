@@ -1,5 +1,6 @@
 
 from curses import window
+from doctest import master
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +10,8 @@ from scipy.interpolate import interp1d
 from scipy.sparse import lil_matrix
 from scipy.sparse.linalg import spsolve
 from scipy.linalg import solve
-
+import numpy as np
+from scipy.spatial import KDTree
 from scipy.interpolate import splrep, splev
 import sys, os
 sys.path.insert(0, '/home/timm/Projects/PIML/subfoil')
@@ -24,9 +26,41 @@ from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 
-from BlockMeshInterpolator import chain_stitch_orientation, compute_jacobian_metrics, concatenate_blocks, read_openfoam_results, read_structured_grids_from_vtm
+from BlockMeshInterpolator import extract_arrays, resample_block_pchip,  chain_stitch_orientation, compute_jacobian_metrics, concatenate_blocks_ml_tensor, read_openfoam_results, read_structured_grids_from_vtm
 
-def get_cmesh(SIM_PATH, VTM_PATH, FOAM_PATH, I0_min, J_MAX, output_type='vts'):
+from scipy.interpolate import PchipInterpolator
+
+def extract_and_resample_wss(block_subgrid, target_ni):
+    """
+    Extracts wallShearStress from the j=0 wall and resamples it 
+    to match the new 1024 topology.
+    """
+    ni, nj, nk = block_subgrid.dimensions
+    
+    # 1. Grab the raw WSS vector field (usually X, Y, Z components)
+    if 'wallShearStress' not in block_subgrid.point_data:
+        # If this is a wake block with no wall, just return zeros
+        return np.zeros((3, target_ni), dtype=np.float32)
+        
+    wss_flat = block_subgrid.point_data['wallShearStress']
+    
+    # 2. Reshape to (Ni, Nj, 3 components) and slice strictly at j=0
+    wss_2d = wss_flat.reshape((ni, nj, nk, 3), order='F')[:, :, 0, :]
+    wss_wall_true_length = wss_2d[:, 0, :] # Shape: [Ni, 3]
+    
+    # 3. 1D PCHIP to the target length
+    old_s = np.linspace(0, 1, ni)
+    new_s = np.linspace(0, 1, target_ni)
+    
+    wss_resampled = np.zeros((3, target_ni), dtype=np.float32)
+    for comp in range(3): # For X, Y, Z shear components
+        interp = PchipInterpolator(old_s, wss_wall_true_length[:, comp])
+        wss_resampled[comp, :] = interp(new_s)
+        
+    return wss_resampled
+
+
+def get_cmesh(SIM_PATH, VTM_PATH, FOAM_PATH,  J_MAX, target_ni_map):
 
     OUT_DIR = "structured_block"
 
@@ -55,11 +89,11 @@ def get_cmesh(SIM_PATH, VTM_PATH, FOAM_PATH, I0_min, J_MAX, output_type='vts'):
     #   block_2 → upper surface TE region
     #   block_1 → wake (back, away from TE)
     BLOCK_ORDER = ['block_0', 'block_3', 'block_5', 'block_4', 'block_2', 'block_1']
+
     grid_by_name = {name: grid for name, grid in grids}
 
-    # need only first 158 points in j direction to cover cartesian domain used in Airfrans data
     # extract_subset takes a single flat extent: [i_min, i_max, j_min, j_max, k_min, k_max]
-    #J_MAX = 158
+    #J_MAX = 216
     #I0_min = 58
     # extract subgrids with correct i extents, keeping all j points up to J_MAX
     subgrids_raw = []
@@ -68,18 +102,28 @@ def get_cmesh(SIM_PATH, VTM_PATH, FOAM_PATH, I0_min, J_MAX, output_type='vts'):
         grid = grid_by_name[bname]
         ni, nj, nk = grid.dimensions
         if bname == 'block_0':
-            sub = grid.extract_subset([I0_min, ni - 1, 0, min(J_MAX, nj - 1), 0, 1])
+            sub = grid.extract_subset([0, ni - 1, 0, min(J_MAX, nj - 1), 0, 1])
             num_wake_cells = sub.dimensions[0]  # length along i-axis
         elif bname == 'block_1':
-            sub = grid.extract_subset([I0_min, ni - 1, 0, min(J_MAX, nj - 1), 0, 1])
+            sub = grid.extract_subset([0, ni - 1, 0, min(J_MAX, nj - 1), 0, 1])
         else:
             sub = grid.extract_subset([0, ni - 1, 0, min(J_MAX, nj - 1), 0, 1])
+
+        # resample to new std block size
         subgrids_raw.append((bname, sub))
         print(f"'{bname}': {grid.dimensions} → {sub.dimensions}  "
               f"pts={sub.n_points}  cells={sub.n_cells}")
 
     print("\nChain-stitching i-axis orientations:")
     subgrids = chain_stitch_orientation(subgrids_raw)
+
+    # Based on statistics of block mesh sizes from Block_statistics.py
+    # standardize block sizes at the following i values
+    # for block in block_order above
+    target_ni_map = {
+        'block_0': 128, 'block_3': 128, 'block_5': 256, 
+        'block_4': 256, 'block_2': 128, 'block_1': 128
+    }
 
     # Keep only the fields we need in the source mesh
     CELL_FIELDS  = ["U", "p", "nut"]           # cell-centred → cell_data
@@ -96,7 +140,14 @@ def get_cmesh(SIM_PATH, VTM_PATH, FOAM_PATH, I0_min, J_MAX, output_type='vts'):
     # same source (foam_combined) is shared across threads → segfault (exit 139).
     # VTK's own SMP threading already parallelises within each .sample() call,
     # so sequential block iteration is sufficient.
-    sampled_list = []
+    
+    # Dictionary to hold our final resampled numpy arrays for each block
+    resampled_blocks = {}
+    # 1. Initialize empty list and strict exclusions
+    ML_FEATURES = [] 
+    EXCLUDE_FROM_VOLUMETRIC = ["wallShearStress", "U"] # Must exclude the raw U vector!
+
+
     for name, sub in subgrids:
         print(f"Sampling '{name}'...")
 
@@ -118,13 +169,21 @@ def get_cmesh(SIM_PATH, VTM_PATH, FOAM_PATH, I0_min, J_MAX, output_type='vts'):
                 out.point_data[field] = pts_sampled.point_data[field]
             else:
                 print(f"  WARNING: point field '{field}' not found for '{name}'")
+        # Force cell data to point data interpolation to node data
+        out = out.cell_data_to_point_data()
+
+        # Split the velocity vector into explicit scalar fields
+        if 'U' in out.point_data:
+            out.point_data['U_of_x'] = out.point_data['U'][:, 0]
+            out.point_data['U_of_y'] = out.point_data['U'][:, 1]
+        # Define the EXACT order of your volumetric channels
+        # (This order becomes the channel indices of your master_tensor)
 
         # Jacobian metric tensors at both points and cell centres for physics-informed interpolation
         jac_point,jac_center = compute_jacobian_metrics(sub)
-        for key, arr in jac_center.items():
-            out.cell_data[key] = arr
-            print(f"Adding cell data '{key}' to '{name}' with shape {arr.shape} and range [{arr.min():.3e}, {arr.max():.3e}]")
         
+     
+
         for key, arr in jac_point.items():
             print(f"Adding point data '{key}' to '{name}' with shape {arr.shape} and range [{arr.min():.3e}, {arr.max():.3e}]")
             # need both z-planes
@@ -132,19 +191,39 @@ def get_cmesh(SIM_PATH, VTM_PATH, FOAM_PATH, I0_min, J_MAX, output_type='vts'):
             arr = np.tile(arr, nz)
             out.point_data[key] = arr
 
+                # Lock the dynamic feature order on the first block
+        if not ML_FEATURES:
+            all_keys = list(out.point_data.keys())
+            # Sorting guarantees the same channel indices every single run
+            ML_FEATURES = sorted([k for k in all_keys if k not in EXCLUDE_FROM_VOLUMETRIC])
+            print(f"Locked in ML_FEATURES channel order: {ML_FEATURES}")   
 
-        sampled_list.append((name, out))
+
+        block_data, block_x, block_y = extract_arrays(out, ML_FEATURES)
+
+        # 4. Apply the 1D PCHIP Resampling to this specific block
+        target_ni = target_ni_map[name]
+        d_resampled, x_resampled, y_resampled = resample_block_pchip(
+            block_data, block_x, block_y, target_ni=target_ni
+        )
+
+
+        wss_blk = extract_and_resample_wss(sub, target_ni)
+
+
+        # Save to dictionary for concatenation
+        resampled_blocks[name] = {
+            'data': d_resampled, 'x': x_resampled, 'y': y_resampled, 'w': wss_blk
+        }
 
     # ── Concatenate into a single StructuredGrid and save ─────────────────────
     print("\nConcatenating blocks along i-axis...")
-    merged = concatenate_blocks(sampled_list, z_ref=0.0)
-    print(f"Merged grid: type={type(merged).__name__}  "
-          f"pts={merged.n_points}  cells={merged.n_cells}  "    
-            f"cell_data={list(merged.cell_data.keys())}  "
-            f"point_data={list(merged.point_data.keys())}")
+    # ── 5. Assemble the Final 1024 Tensor ─────────────────────
+    # Pass the dictionary directly to the new assembler
+    master_tensor, master_x, master_y = concatenate_blocks_ml_tensor(resampled_blocks)
     
-
-    return merged, num_wake_cells
+    return master_tensor, master_x, master_y, ML_FEATURES
+    
 
 def cell_centers(X, Y):
     """Return cell-centre coordinates for a structured grid.
@@ -179,16 +258,25 @@ def run_panel_method(x_wall, y_wall, X, Y,
     cl_pot = panel_foil.compute_lift_coefficient()
     panel_foil.compute_coefficients_from_pressure()
 
-    # Use cell-centre coordinates: centres are half a cell away from the wall
-    # so k=0 centres are never on a panel and near-singular behaviour is avoided.
-    X_c, Y_c = cell_centers(X, Y)   # shape (n_eta-1, n_xi-1)
+    # so k=0.01 offset cells are never on a panel and near-singular behaviour is avoided.
+    # 1. Create safe copies of the coordinates
+    X_safe = X.copy()
+    Y_safe = Y.copy()
 
-    U_out, V_out, *_ = panel_foil.compute_velocity_field(X_c, Y_c)
+    # 2. Calculate the vector pointing from the wall (j=0) to the first node (j=1)
+    dx = X[:, 1] - X[:, 0]
+    dy = Y[:, 1] - Y[:, 0]
+
+    # 3. Shift the wall nodes inward by just 1% of that distance
+    X_safe[:, 0] = X[:, 0] + (dx * 0.01)
+    Y_safe[:, 0] = Y[:, 0] + (dy * 0.01)
+
+    U_out, V_out, *_ = panel_foil.compute_velocity_field(X_safe, Y_safe)
     U  = U_out
     V  = V_out
     Cp = 1.0 - (U_out**2 + V_out**2) / U_inf**2
 
-    return X_c, Y_c, U, V, Cp, cl_pot
+    return X_safe, Y_safe, U, V, Cp, cl_pot
 
 
 def plot_physical_space(cmesh,path, name, show_plots=False  ):
@@ -450,16 +538,58 @@ def compute_nodal_metrics(X_grid, Y_grid):
     
     return x_xi, x_eta, y_xi, y_eta, det_J
 
-def process_airfrans_calc_potentialflow(name, AF_ROOT, OF_ROOT, STORAGE_DIR, I0_min, J_MAX, output_type='vts', show_plots=False):
+
+def calculate_and_append_sdf(master_tensor, master_x, master_y, k=5.0):
+    """
+    Calculates the SDF using the NumPy coordinate grids and appends 
+    exp_sdf as a new channel to the master_tensor.
+    """
+    print("\nCalculating SDF on the 1024x216 master grid...")
+    
+    # 1. Extract the Wall Coordinates
+    # In your stitched topology, the wall is strictly at index j=0
+    wall_x = master_x[:, 0]  # Shape: (1024,)
+    wall_y = master_y[:, 0]  # Shape: (1024,)
+    wall_xy = np.column_stack((wall_x, wall_y)) # Shape: (1024, 2)
+    
+    # 2. Flatten all coordinates for the KDTree query
+    all_x = master_x.flatten()
+    all_y = master_y.flatten()
+    all_xy = np.column_stack((all_x, all_y))    # Shape: (221184, 2)
+    
+    # 3. Query the KDTree
+    tree = KDTree(wall_xy)
+    sdf_flat, _ = tree.query(all_xy, workers=-1)
+    
+    # 4. Reshape back to the 2D spatial grid
+    sdf_2d = sdf_flat.reshape(master_x.shape)   # Shape: (1024, 216)
+    sdf_fixed = np.nan_to_num(sdf_2d, nan=0.0).astype(np.float32)
+    
+    # 5. Calculate the Exponential SDF
+    exp_sdf_2d = np.exp(-k * sdf_fixed).astype(np.float32)
+    
+    print(f"SDF Range: min={sdf_fixed.min():.6f}, max={sdf_fixed.max():.6f}, mean={sdf_fixed.mean():.6f}")
+    print(f"Exp_SDF Range: min={exp_sdf_2d.min():.6f}, max={exp_sdf_2d.max():.6f}")
+    
+    # 6. Append exp_sdf to the master_tensor
+    # We add a dummy channel dimension [1, 1024, 216] so it concatenates properly
+    exp_sdf_expanded = np.expand_dims(exp_sdf_2d, axis=0)
+    master_tensor_updated = np.concatenate([master_tensor, exp_sdf_expanded], axis=0)
+    
+    print(f"Updated Master Tensor Shape: {master_tensor_updated.shape}")
+    
+    return master_tensor_updated, sdf_fixed, exp_sdf_2d
+
+def process_airfrans_calc_potentialflow(name, AF_ROOT, OF_ROOT, STORAGE_DIR,  J_MAX, output_type='vts', show_plots=False):
+        # recommend using J_MAX = 216 
         print(f"\n=== Processing Airfrans simulation: {name} ===")
-        print(f"AF_ROOT: {AF_ROOT}  OF_ROOT: {OF_ROOT}  STORAGE_DIR: {STORAGE_DIR}  I0_min: {I0_min}  J_MAX: {J_MAX}  output_type: {output_type}")
+        print(f"AF_ROOT: {AF_ROOT}  OF_ROOT: {OF_ROOT}  STORAGE_DIR: {STORAGE_DIR}   J_MAX: {J_MAX}  output_type: {output_type}")
         # check if archive exists
 
         archive_out = f"{STORAGE_DIR}/{name}_C_mesh_512x64.pt"
         if os.path.exists(archive_out):
             print(f" Skipping {name}   Found existing file {archive_out}")
             return
-
 
         simulation = af.Simulation(root=AF_ROOT, name=name)
 
@@ -468,34 +598,33 @@ def process_airfrans_calc_potentialflow(name, AF_ROOT, OF_ROOT, STORAGE_DIR, I0_
         VTM_PATH = f"{SIM_PATH}/constant/blockMeshVTK/blockMesh.vtm"
         FOAM_PATH = f"{SIM_PATH}/touch.foam"
 
-        #I0_min = 56
-        #J_MAX = 158 # 158 
-        cmesh, num_wake_cells = get_cmesh(SIM_PATH, VTM_PATH, FOAM_PATH, I0_min, J_MAX, output_type='vts')
-        print(f"Extracted C-mesh: type={type(cmesh).__name__}  pts={cmesh.n_points}  cells={cmesh.n_cells}  "
-                f"cell_data={list(cmesh.cell_data.keys())}  point_data={list(cmesh.point_data.keys())}")
-        nx, ny, nz = cmesh.dimensions
-        X = cmesh.points[:, 0].reshape((nx, ny, nz), order='F').squeeze()
-        Y = cmesh.points[:, 1].reshape((nx, ny, nz), order='F').squeeze()
+        target_ni_map = {
+            'block_0': 128, 'block_3': 128, 'block_5': 256, 
+            'block_4': 256, 'block_2': 128, 'block_1': 128
+        }
 
-        print(f"number of cells in wake region (block_0): {num_wake_cells}")
-        # Wake cells for 
-        I_START = num_wake_cells
-        I_END = nx-I_START+1
+        master_tensor, master_x, master_y, ML_FEATURES = get_cmesh(SIM_PATH, VTM_PATH, FOAM_PATH, J_MAX =J_MAX , target_ni_map=target_ni_map)
+        print(f"Extracted C-mesh: type={type(master_tensor).__name__}  pts={master_tensor.n_points}  cells={master_tensor.n_cells}  "
+                f"cell_data={list(master_tensor.cell_data.keys())}  point_data={list(master_tensor.point_data.keys())}")
+        
+        nx, ny, nz = master_tensor.dimensions
 
-        x_wall = X[I_START:I_END, 0]  # i varies along the wall
-        y_wall = Y[I_START:I_END, 0]
+        I_START = target_ni_map['block_0']
+        I_END = nx - target_ni_map['block_3']
+
+        x_wall = master_x[I_START:I_END, 0]  # i varies along the wall
+        y_wall = master_y[I_START:I_END, 0]
         print(f"Extracted wall points: {len(x_wall)}")
         # Airfrans wall points
 
         af_points = simulation.airfoil.points # (N,3)
-
 
         x_wall_af = af_points[:, 0]
         y_wall_af = af_points[:, 1]
         print(f"Extracted wall points from Airfrans: {len(x_wall_af)}")
 
         if len(x_wall_af) != len(x_wall):
-            print(f" ⚠️ Warning: Number of wall points from Airfrans ({len(x_wall_af)}) does not match OpenFOAM ({len(x_wall)}).")
+            print(f" Number of wall points from Airfrans ({len(x_wall_af)}) does not match OpenFOAM ({len(x_wall)}).")
         x_wall_af_max = np.max(x_wall_af)
         x_wall_af_min = np.min(x_wall_af)
         print(f"Airfrans wall x range: [{x_wall_af_min:.3f}, {x_wall_af_max:.3f}]")
@@ -505,33 +634,9 @@ def process_airfrans_calc_potentialflow(name, AF_ROOT, OF_ROOT, STORAGE_DIR, I0_
         
         # Need to calculate the SDF /implicit distance from the wall to the first cell centres 
         # add z-axis for PyVista PolyData
+        # Calculate SDF and append it as the final channel
+        master_tensor, sdf_grid, exp_sdf_grid = calculate_and_append_sdf( master_tensor, master_x, master_y, k=5.0 )
 
-        # Compute unsigned distance from each cell centre to the nearest wall
-        # node using a KD-tree.  vtkImplicitPolyDataDistance (used by
-        # compute_implicit_distance) requires triangulated faces and fails on
-        # a bare point-cloud / polyline, so we use scipy instead.
-        from scipy.spatial import KDTree
-        wall_xy  = np.column_stack((x_wall, y_wall))          # (N_wall, 2)
-        tree     = KDTree(wall_xy)
-        centers  = cmesh.cell_centers()                        # PolyData
-        cc_xy    = centers.points[:, :2]                       # (N_cells, 2)
-        sdf_dist, _ = tree.query(cc_xy, workers=-1)            # unsigned dist
-
-        sdf_fixed = np.nan_to_num(sdf_dist, nan=0.0).astype(np.float32)
-
-        print(f"Shape of SDF array: {sdf_fixed.shape}  min: {sdf_fixed.min():.6f}  max: {sdf_fixed.max():.6f}  mean: {sdf_fixed.mean():.6f}")
-        print(f" shape of cell data: {cmesh.cell_data['U'].shape}  {cmesh.cell_data['p'].shape}  {cmesh.cell_data['nut'].shape} ")
-        cmesh.cell_data['sdf'] = sdf_fixed          
-        # decay factor
-        k=5.0  # 2 not fast enough
-        cmesh.cell_data['exp_sdf'] = np.exp(-k*sdf_fixed)  # add exp(-sdf) as an additional feature to capture near-wall effects with sharper gradients
-
-        tree_p     = KDTree(wall_xy)
-        points  = cmesh.points[:,:2]                      # PNode data 
-        sdf_point_dist, _ = tree.query(points, workers=-1)            # unsigned dist  
-        sdf_point_fixed = np.nan_to_num(sdf_point_dist, nan=0.0).astype(np.float32)
-        cmesh.point_data['sdf'] = sdf_point_fixed
-        cmesh.point_data['exp_sdf'] = np.exp(-k*sdf_point_fixed)
 
         print (f"Running panel method with {len(x_wall)} wall points...")
         AOA = simulation.angle_of_attack * 180 / np.pi
@@ -544,68 +649,56 @@ def process_airfrans_calc_potentialflow(name, AF_ROOT, OF_ROOT, STORAGE_DIR, I0_
         print(f"Angle of attack: {AOA:.2f} degrees")
         print(f"Freestream velocity: {U_inf:.2f} m/s")
 
-        print(f" Shape of X: {X.shape}  Y: {Y.shape} ")
+        print(f" Shape of X: {master_x.shape}  Y: {master_y.shape} ")
 
         PATH_POTENTIAL = SIM_PATH + "/potential"
         os.makedirs(PATH_POTENTIAL, exist_ok=True)  
 
-        X_c, Y_c, u, v, Cp, cl_pot = run_panel_method(x_wall,y_wall, X, Y,  alpha_aoa=AOA, U_inf=1.0, path=PATH_POTENTIAL)
+        X_off, Y_off, U_pot, V_pot, Cp_pot, cl_pot = run_panel_method(x_wall,y_wall, master_x, master_y,  alpha_aoa=AOA, U_inf=1.0, path=PATH_POTENTIAL)
+        
+        U_of_x = master_tensor[ML_FEATURES.index("U_of_x")]
+        U_of_y = master_tensor[ML_FEATURES.index("U_of_y")]
+        p_of   = master_tensor[ML_FEATURES.index("p")]
+        nut_of = master_tensor[ML_FEATURES.index("nut")]
+        # 2. Normalize OpenFOAM CFD Data
+        U_x = U_of_x / U_inf
+        U_y = U_of_y / U_inf
+        Cp = p_of / (0.5 * U_inf**2)
 
+        # 3. Calculate Deltas and ML Targets
+        U_x_delta = U_x - U_pot
+        U_y_delta = U_y - V_pot
+        Cp_delta = Cp - Cp_pot
         # Lift from panel method vs Airfrans forces for verification
 
-
-
-        print(f"From OpenFoam Shape of X: {X.shape}  Y: {Y.shape}  ")
-        print(f"Cell centers Shape of X_c: {X_c.shape}  Y_c: {Y_c.shape}  u: {u.shape}  v: {v.shape}  Cp: {Cp.shape} ")
+        print(f"From OpenFoam Shape of X: {master_x.shape}  Y: {master_y.shape}  ")
+        print(f"Cell centers Shape of X_c: {X_off.shape}  Y_c: {Y_off.shape}  u: {u.shape}  v: {v.shape}  Cp: {Cp.shape} ")
         
-        # put potential flow solution onto the Openfoam C-mesh 
-        cmesh.cell_data['Cp_pot'] = Cp.ravel(order='F')
-        cmesh.cell_data['U_x_pot'] = u.ravel(order='F') 
-        cmesh.cell_data['U_y_pot'] = v.ravel(order='F') 
-
-        # convert openfoam data 
-        cmesh.cell_data['U_x'] = cmesh.cell_data['U'][:, 0] /U_inf
-        cmesh.cell_data['U_y'] = cmesh.cell_data['U'][:, 1] /U_inf
-        cmesh.cell_data.pop('U')  # remove original vector field to avoid  
-
-        #rho = simulation.RHO
-
-        # p is kinematic pressure (p/rho), so we can directly compute Cp without needing to know the density
-
-        cmesh.cell_data['Cp'] = cmesh.cell_data['p'] / (0.5 *  U_inf**2)  # rename pressure to Cp for consistency
-
-        cmesh.cell_data.pop('p')  # remove original pressure field to avoid confusion
-        cmesh.cell_data['Cp_delta'] = cmesh.cell_data['Cp'] - cmesh.cell_data['Cp_pot']
-        cmesh.cell_data['U_x_delta'] = cmesh.cell_data['U_x'] - cmesh.cell_data['U_x_pot']
-        cmesh.cell_data['U_y_delta'] = cmesh.cell_data['U_y'] - cmesh.cell_data['U_y_pot'] 
-        cmesh.cell_data['log_nut_ratio'] =  np.log10(np.clip(cmesh.cell_data['nut'], 1e-12, None) / nu)  # take log(nut/nu) to compress range for ML training
+        nut_eps = 1e-12
+        nut_ratio = np.clip(nut_of / nu, 1e-12, None)
+        nut_ratio_cuberoot = np.power(nut_ratio + nut_eps, 1/3).astype(np.float32)
         
-        # interpolate cell Cp to points for better visualization and to match input features which are point-based
-        nodal_mesh = cmesh.cell_data_to_point_data()
+        
+        x_data_spatial = np.stack([
+            master_x, master_y,
+            U_pot, V_pot, Cp_pot,
+            sdf_grid,
+            x_xi, x_eta, y_xi, y_eta, det_J  # Assuming these were calculated/extracted
+        ], axis=0)
 
-        cmesh.point_data['Cp'] = nodal_mesh['Cp']  
-        cmesh.point_data['sdf'] = nodal_mesh['sdf']
-        cmesh.point_data['exp_sdf'] = nodal_mesh['exp_sdf']
-        cmesh.point_data['x_xi'] = nodal_mesh['x_xi']
-        cmesh.point_data['x_eta'] = nodal_mesh['x_eta']
-        cmesh.point_data['y_xi'] = nodal_mesh['y_xi']
-        cmesh.point_data['y_eta'] = nodal_mesh['y_eta']
-        cmesh.point_data['det_J'] = nodal_mesh['det_J']
-        cmesh.point_data['U_x_pot'] = nodal_mesh['U_x_pot']       
-        cmesh.point_data['U_y_pot'] = nodal_mesh['U_y_pot']       
-        cmesh.point_data['Cp_pot'] = nodal_mesh['Cp_pot']    
-        cmesh.point_data['U_x'] = nodal_mesh['U_x']
-        cmesh.point_data['U_y'] = nodal_mesh['U_y']
-        cmesh.point_data['Cp_delta'] = nodal_mesh['Cp_delta']
-        cmesh.point_data['U_x_delta'] = nodal_mesh['U_x_delta']
-        cmesh.point_data['U_y_delta'] = nodal_mesh['U_y_delta']
-        cmesh.point_data['nut'] = nodal_mesh['nut']
-        cmesh.point_data['log_nut_ratio'] = nodal_mesh['log_nut_ratio']  
-        cmesh.point_data['wallShearStress_x'] = nodal_mesh['wallShearStress'][:, 0]
-        cmesh.point_data['wallShearStress_y'] = nodal_mesh['wallShearStress'][:, 1]
+        y_delta_spatial = np.stack([ Cp_delta, U_x_delta, U_y_delta, nut_ratio_cuberoot
+        ], axis=0)
 
-        n_xi, n_eta, nz = cmesh.dimensions
+        y_out_spatial = np.stack([
+            U_x, U_y, Cp, nut_of
+            # Note: wallShearStress is 1D now, so we keep it separate from the 2D tensor
+        ], axis=0)
 
+        print(f"Input Tensor Shape: {x_data_spatial.shape}")      # Expected: (11, 1024, 216)
+        print(f"Delta Target Shape: {y_delta_spatial.shape}")     # Expected: (4, 1024, 216)
+        print(f"Full Output Shape:  {y_out_spatial.shape}")      # Expected: (4, 1024, 216)
+
+   
 
         plot_physical_space(cmesh, SIM_PATH, name, show_plots=False)
         plot_latent_space(cmesh, SIM_PATH, name, show_plots=False)
@@ -617,37 +710,7 @@ def process_airfrans_calc_potentialflow(name, AF_ROOT, OF_ROOT, STORAGE_DIR, I0_
 
         print(f" Airfrans Cl = {cl:.5f}, Cl_pot = {cl_pot:.5f}, Cl_delta = {cl - cl_pot:.5f}")
 
-        #print(f"  Cd: {cd:.5f}, Cdp: {cdp:.5f}, Cdv: {cdv:.5f}, Cl: {cl:.5f}, Clp: {clp:.5f}, Clv: {clv:.5f}")
-        # stack the input features and output fields into tensors
-        x_data = np.column_stack((cmesh.points[:, 0].ravel(order='F'),
-                                    cmesh.points[:, 1].ravel(order='F'),
-                                    cmesh.point_data['U_x_pot'],
-                                    cmesh.point_data['U_y_pot'],
-                                    cmesh.point_data['Cp_pot'],
-                                    cmesh.point_data['sdf'],
-                                    cmesh.point_data['exp_sdf'],
-                                    cmesh.point_data['x_xi'],
-                                    cmesh.point_data['x_eta'],
-                                    cmesh.point_data['y_xi'],
-                                    cmesh.point_data['y_eta'],
-                                    cmesh.point_data['det_J']
-                                    ))  # shape (n_cells, 2)
-        
-        print(f"Shape of input feature array x_data: {x_data.shape}  sample: {x_data[0]}")
-        
-        y_delta = np.column_stack((cmesh.point_data['Cp_delta'],
-                                    cmesh.point_data['U_x_delta'],
-                                    cmesh.point_data['U_y_delta'],
-                                    cmesh.point_data['log_nut_ratio']))
-        print(f"Shape of output delta array y_delta: {y_delta.shape}  sample: {y_delta[0]}")
-        y_out  = np.column_stack((
-                                    cmesh.point_data['U_x'],
-                                    cmesh.point_data['U_y'],
-                                    cmesh.point_data['Cp'],
-                                    cmesh.point_data['nut'],
-                                    cmesh.point_data['wallShearStress_x'],  # wall shear stress x-component
-                                    cmesh.point_data['wallShearStress_y']  # wall shear stress y-component
-                                    ))
+ 
         print(f"Shape of output array y_out: {y_out.shape}  sample: {y_out[0]}")
 
         props = {
@@ -672,7 +735,8 @@ def process_airfrans_calc_potentialflow(name, AF_ROOT, OF_ROOT, STORAGE_DIR, I0_
         y_delta_tensor = torch.tensor(y_delta, dtype=torch.float32)
         y_out_tensor = torch.tensor(y_out, dtype=torch.float32)
 
-        # reshape x_data to (Channels, 1182, 159) for PyTorch convention (C, H, W)
+        # reshape x_data to (Channels, 1182, 216) for PyTorch convention (C, H, W)
+
         x_data_spatial = x_tensor.view(n_eta, n_xi, 12).permute(2, 1, 0)
         y_delta_spatial = y_delta_tensor.view(n_eta, n_xi, 4).permute(2, 1, 0)
         y_out_spatial = y_out_tensor.view(n_eta, n_xi, 6).permute(2, 1, 0)
@@ -725,6 +789,12 @@ def process_airfrans_calc_potentialflow(name, AF_ROOT, OF_ROOT, STORAGE_DIR, I0_
         print(f"Max Cp of {cp_field[i_max, j_max]:.4f} found at i={i_max}, j={j_max}")
         print(f" Save Complete Archive")
         save_to_pytorch( STORAGE_DIR, name, archive_dict)
+
+
+        # Resample to constant shape centered about the leading edge
+
+
+
 
         # Resample to different grid resolutions for data augmentation and to test interpolation methods
 

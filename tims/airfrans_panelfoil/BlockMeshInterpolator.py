@@ -1,6 +1,7 @@
 import pyvista as pv
 import numpy as np
 import os
+from scipy.interpolate import PchipInterpolator
 
 def read_structured_grids_from_vtm(vtm_path):
     """Reads a VTM file and returns a list of all StructuredGrids found."""
@@ -252,6 +253,62 @@ def compute_jacobian_metrics(sub: pv.StructuredGrid) -> dict:
           f"max_rel_err={max_rel_err:.3e}")
     return result_points, result_cell_center
 
+import numpy as np
+
+def concatenate_blocks_ml_tensor(resampled_blocks: dict, BLOCK_ORDER):
+    """
+    Concatenates the resampled block dictionaries into a single, perfectly 
+    aligned ML tensor, dropping the overlapping boundary nodes.
+    
+    Args:
+        resampled_blocks: Dictionary containing 'data', 'x', and 'y' arrays per block.
+        J_MAX: The final normal-direction crop (drops extreme far-field).
+        
+    Returns:
+        final_data: np.ndarray [Channels, 1024, J_MAX]
+        final_x: np.ndarray [1024, J_MAX]
+        final_y: np.ndarray [1024, J_MAX]
+    """
+    # The physical wrapper sequence around the C-mesh
+    
+    data_parts = []
+    x_parts = []
+    y_parts = []
+    w_parts =[] 
+    
+    for i, name in enumerate(BLOCK_ORDER):
+        b = resampled_blocks[name]
+        d = b['data']  # [Channels, Ni, Nj]
+        x = b['x']     # [Ni, Nj]
+        y = b['y']     # [Ni, Nj]
+        w = b['wss']   # [Ni]
+        
+        # Deduplication: Drop the last i-node for every block EXCEPT the final wake block
+        if i < len(BLOCK_ORDER) - 1:
+            data_parts.append(d[:, :-1, :])
+            x_parts.append(x[:-1, :])
+            y_parts.append(y[:-1, :])
+            w_parts.append(w[:-1])
+        else:
+            data_parts.append(d)
+            x_parts.append(x)
+            y_parts.append(y)
+            w_parts.append(w)
+            
+    # Concatenate along the i-axis (dim=1 for data, dim=0 for coordinates)
+    final_data = np.concatenate(data_parts, axis=1)
+    final_x = np.concatenate(x_parts, axis=0)
+    final_y = np.concatenate(y_parts, axis=0)
+    final_w = np.concatenate(w_parts,axis=1)
+        
+    print(f"\nFinal ML Tensor Assembled: {final_data.shape}")
+    print(f"Total i-nodes (Data): {final_data.shape[1]}  (Target: 1024)")
+    print(f"Total i-nodes (Y-coord): {final_y.shape[0]}  (Target: 1024)") 
+    print(f"Total i-nodes (WSS): {final_w.shape[1]}  (Target: 1024)")
+
+    return final_data, final_x, final_y,final_w
+
+
 
 def concatenate_blocks(sampled: list, z_ref: float = 0.0) -> pv.StructuredGrid:
     """
@@ -340,6 +397,78 @@ def concatenate_blocks(sampled: list, z_ref: float = 0.0) -> pv.StructuredGrid:
             else cat.reshape((-1,) + cat.shape[2:], order='F')
 
     return merged
+
+
+
+import numpy as np
+
+def extract_arrays(subgrid, feature_list):
+    """
+    Extracts coordinates and flow variables from a PyVista StructuredGrid block
+    and reshapes them into proper 2D spatial numpy arrays.
+    
+    Args:
+        subgrid: pyvista.StructuredGrid (e.g., from chain_stitch_orientation)
+        feature_list: list of strings (keys in subgrid.point_data)
+        
+    Returns:
+        data: np.ndarray shape [Channels, Ni, Nj]
+        X: np.ndarray shape [Ni, Nj]
+        Y: np.ndarray shape [Ni, Nj]
+    """
+    ni, nj, nk = subgrid.dimensions
+    
+    # 1. Extract and reshape physical coordinates
+    # order='F' maps the flat VTK array back to (i, j, k) correctly
+    # [:, :, 0] safely drops the empty Z (k) dimension
+    X = subgrid.points[:, 0].reshape((ni, nj, nk), order='F')[:, :, 0]
+    Y = subgrid.points[:, 1].reshape((ni, nj, nk), order='F')[:, :, 0]
+    
+    # 2. Initialize the multi-channel data tensor
+    C = len(feature_list)
+    data = np.zeros((C, ni, nj), dtype=np.float32)
+    
+    # 3. Extract and reshape each requested flow feature
+    for c, feat_name in enumerate(feature_list):
+        if feat_name not in subgrid.point_data:
+            raise KeyError(f"Feature '{feat_name}' not found in block point_data. Available: {list(subgrid.point_data.keys())}")
+            
+        flat_array = subgrid.point_data[feat_name]
+        data[c, :, :] = flat_array.reshape((ni, nj, nk), order='F')[:, :, 0]
+        
+    return data, X, Y
+
+def resample_block_pchip(block_data, block_x, block_y, target_ni=256):
+    """
+    block_data: [Channels, Ni, Nj]
+    block_x, block_y: [Ni, Nj]
+    Returns perfectly interpolated data and coordinates to target_ni length.
+    """
+    C, Ni, Nj = block_data.shape
+    
+    # We use 'computational space' (index fraction from 0 to 1)
+    old_s = np.linspace(0, 1, Ni)
+    new_s = np.linspace(0, 1, target_ni)
+    
+    # Initialize output arrays
+    new_data = np.zeros((C, target_ni, Nj), dtype=np.float32)
+    new_x = np.zeros((target_ni, Nj), dtype=np.float32)
+    new_y = np.zeros((target_ni, Nj), dtype=np.float32)
+    
+    # Interpolate J-layer by J-layer (Zero vertical bleeding)
+    for j in range(Nj):
+        # 1. Resample coordinates (Preserves LE clustering)
+        interp_x = PchipInterpolator(old_s, block_x[:, j])
+        interp_y = PchipInterpolator(old_s, block_y[:, j])
+        new_x[:, j] = interp_x(new_s)
+        new_y[:, j] = interp_y(new_s)
+        
+        # 2. Resample flow channels
+        for c in range(C):
+            interp_c = PchipInterpolator(old_s, block_data[c, :, j])
+            new_data[c, :, j] = interp_c(new_s)
+            
+    return new_data, new_x, new_y
 
 
 if __name__ == "__main__":
