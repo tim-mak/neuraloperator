@@ -310,10 +310,10 @@ def convert_pt_to_cmesh_pyvista(x, y_delta,y_out):
     # ---- derived RANS fields: rans = potential + delta ----
     cmesh.point_data["U_x_rans"] = flat(y_out[0])
     cmesh.point_data["U_y_rans"] = flat( y_out[1])
-    cmesh.point_data["Cp_rans"]  = flat( y_out[2])
+    cmesh.point_data["p_rans"]  = flat( y_out[2])
     cmesh.point_data["nut_rans"] = flat( y_out[3])
-    cmesh.point_data["wall_shear_stress_x_rans"] = flat( y_out[4])
-    cmesh.point_data["wall_shear_stress_y_rans"] = flat( y_out[5])
+    #cmesh.point_data["wall_shear_stress_x_rans"] = flat( y_out[4])
+    #cmesh.point_data["wall_shear_stress_y_rans"] = flat( y_out[5])
     return cmesh
 
 def physical_to_latent_mapping(cmesh, show_plots=False):

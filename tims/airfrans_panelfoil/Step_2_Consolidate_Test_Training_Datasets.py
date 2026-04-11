@@ -6,7 +6,7 @@ import shutil
 import numpy as np
 import pyvista as pv
 
-
+import os
 
 def consolidate_airfrans_dataset(
     data_root: Path,
@@ -20,6 +20,14 @@ def consolidate_airfrans_dataset(
 ):
     """
     Consolidate individual simulation .pt files into PTDataset format.
+    each pt file is expected to contain:
+    archive_dict = {
+            'x': torch.tensor(x_data_spatial, dtype=torch.float32),
+            'y_delta': torch.tensor(y_delta_spatial, dtype=torch.float32),
+            'y': torch.tensor(y_out_spatial, dtype=torch.float32),
+            'wss': torch.tensor(master_w, dtype=torch.float32), 
+            'props': props
+        }
     
     Args:
         data_root: Root directory containing simulation folders
@@ -43,8 +51,11 @@ def consolidate_airfrans_dataset(
             
             # Collect all data for this split
             all_x = []
-            all_y = []
+            all_y_delta = []
+            all_y_total = []
             all_props = []
+
+            all_wss = []
             
             for sim_run in tqdm(sim_runs, desc=f"Loading {split_name}"):
                 sim_path = data_root 
@@ -53,17 +64,19 @@ def consolidate_airfrans_dataset(
                 if data_file.exists():
                     try:
                         data = torch.load(data_file)
-                        data.pop('y_out', None)  # Remove y_out if it exists
-                        data['y'] = data.pop('y_delta') # Rename to y for consistency
-
                         all_x.append(data['x'].unsqueeze(0))  # Add batch dimension
-                        all_y.append(data['y'].unsqueeze(0))  # Add batch dimension
+                        all_y_delta.append(data['y_delta'].unsqueeze(0))  # Add batch dimension
+                        all_y_total.append(data['y'].unsqueeze(0))  # Add batch dimension
+                        all_wss.append(data['wss'].unsqueeze(0))  # Add batch dimension
                         
                         p = data.get('props', {})
+
+
                         if isinstance(p, list) and len(p) > 0:
                             all_props.append(p[0])
                         else:
                             all_props.append(p)
+                        
                     except Exception as e:
                         print(f"Error loading {data_file}: {e}")
                         continue
@@ -73,11 +86,15 @@ def consolidate_airfrans_dataset(
             if all_x:
                 # Stack all samples along batch dimension
                 consolidated_x = torch.cat(all_x, dim=0)  # Shape: [N, C, H, W]
-                consolidated_y = torch.cat(all_y, dim=0)  # Shape: [N, C, H, W]
+                consolidated_y_delta = torch.cat(all_y_delta, dim=0)  # Shape: [N, C, H, W]
+                consolidated_y_total = torch.cat(all_y_total, dim=0)  # Shape: [N, C, H, W]
+                consolidated_wss_total = torch.cat(all_wss, dim=0)
                 
                 consolidated_data = {
                     'x': consolidated_x,
-                    'y': consolidated_y,
+                    'y_delta': consolidated_y_delta,
+                    'y_total': consolidated_y_total,
+                    'wss': consolidated_wss_total,
                     'props': all_props
                 }
                 
@@ -90,7 +107,8 @@ def consolidate_airfrans_dataset(
                 torch.save(consolidated_data, output_file)
                 print(f"  Saved {output_file} with {consolidated_x.shape[0]} samples")
                 print(f"    Input shape: {consolidated_x.shape}")
-                print(f"    Output shape: {consolidated_y.shape}")
+                print(f"    Output delta shape: {consolidated_y_delta.shape}")
+                print(f"    Output total shape: {consolidated_y_total.shape}")
                 print(f"    Props count: {len(all_props)}")
                 print(f"    Props keys: {list(all_props[0].keys()) if all_props else 'N/A'}")
 
@@ -98,7 +116,7 @@ def consolidate_airfrans_dataset(
 def main():
     # Configuration
     data_root = Path("/home/timm/storage/AF_NO_DATASET/Archive")
-    output_dir = Path("/home/timm/storage/AF_NO_DATASET")
+    output_dir = Path("/home/timm/storage/AF_NO_DATASET/ArchiveConsolidated")
 
     manifest_file = Path("/home/timm/Projects/PIML/Dataset/manifest.json")
     
@@ -127,14 +145,13 @@ def main():
         }
     
     #grid_sizes=[(64,64),(128,128), (256,256), (512,512), (1024, 1024)]
+    os.makedirs(output_dir, exist_ok=True)
     # Run consolidation
     consolidate_airfrans_dataset(
         data_root=data_root,
         output_dir=output_dir,
         splits_config=splits_config,
-        xlim=6,
-        ylim=3,
-        grid_sizes=[ (256, 32),(512, 64),( 1024, 128)]
+        grid_sizes=[ (1025,217)]
     )
     shutil.copy(manifest_file, Path(data_root) / "manifest.json")
     shutil.copy(manifest_file, Path(output_dir) / "manifest.json")

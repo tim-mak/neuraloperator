@@ -1,0 +1,20 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../subfoil"
+		},
+		{
+			"path": "../OF_dataset"
+		},
+		{
+			"path": "../../../storage/AF_NO_DATASET"
+		},
+		{
+			"path": "../../../storage/AF_small"
+		}
+	],
+	"settings": {}
+}

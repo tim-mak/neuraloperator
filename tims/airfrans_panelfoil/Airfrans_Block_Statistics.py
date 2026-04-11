@@ -72,5 +72,5 @@ def analyze_block_statistics(dataset_path="OF_dataset"):
 
 if __name__ == "__main__":
 
-    OF_DATASET_DIR = "/home/timm/Projects/PIML/OF_dataset"
+    OF_DATASET_DIR = "/home/timm/storage/AF_NO_DATASET/OF_dataset"
     analyze_block_statistics(OF_DATASET_DIR)

@@ -1,49 +1,525 @@
+from csv import reader
+import airfrans as af
 import pyvista as pv
 import numpy as np
 import os
+import xml.etree.ElementTree as ET
 from scipy.interpolate import PchipInterpolator
+import matplotlib.pyplot as plt
+from scipy.spatial import KDTree
+
+
+def _sanitize_vtk_block_name(name):
+    return "".join(ch if (ch.isalnum() or ch in ("_", "-")) else "_" for ch in str(name))
+
+
+def _vtk_extent_from_dimensions(dimensions):
+    ni, nj, nk = [int(v) for v in dimensions]
+    return f"0 {ni - 1} 0 {nj - 1} 0 {nk - 1}"
+
+
+def _vtk_type_from_dtype(dtype):
+    d = np.dtype(dtype)
+    if np.issubdtype(d, np.floating):
+        return "Float32" if d.itemsize <= 4 else "Float64"
+    if np.issubdtype(d, np.signedinteger):
+        return "Int32" if d.itemsize <= 4 else "Int64"
+    if np.issubdtype(d, np.unsignedinteger):
+        return "UInt32" if d.itemsize <= 4 else "UInt64"
+    raise TypeError(f"Unsupported dtype for VTK ASCII export: {d}")
+
+
+def _normalize_dataarray_for_vtk(arr, expected_tuples, array_name):
+    arr = np.asarray(arr)
+    if arr.ndim == 0:
+        raise ValueError(f"Data array '{array_name}' is scalar; expected tuple array.")
+
+    if arr.ndim == 1:
+        tuple_count = arr.shape[0]
+        num_components = 1
+        out = arr.reshape((-1, 1))
+    else:
+        tuple_count = arr.shape[0]
+        num_components = int(np.prod(arr.shape[1:]))
+        out = arr.reshape((tuple_count, num_components))
+
+    if tuple_count != expected_tuples:
+        raise ValueError(
+            f"Data array '{array_name}' tuple count mismatch: expected {expected_tuples}, got {tuple_count}."
+        )
+    return out, num_components
+
+
+def _format_ascii_numeric(value, is_float):
+    if is_float:
+        return f"{float(value):.16g}"
+    return str(int(value))
+
+
+def _dataarray_to_ascii_block(data_2d):
+    is_float = np.issubdtype(data_2d.dtype, np.floating)
+    lines = []
+    for row in data_2d:
+        lines.append(" ".join(_format_ascii_numeric(v, is_float) for v in row))
+    return "\n".join(lines)
+
+
+def _write_structured_grid_vts_ascii(grid, vts_path):
+    ni, nj, nk = [int(v) for v in grid.dimensions]
+    n_points = ni * nj * nk
+    n_cells = (ni - 1) * (nj - 1) * (1 if nk == 1 else (nk - 1))
+    extent = _vtk_extent_from_dimensions((ni, nj, nk))
+
+    point_data_xml = []
+    for key in list(grid.point_data.keys()):
+        data_2d, n_comp = _normalize_dataarray_for_vtk(grid.point_data[key], n_points, key)
+        vtk_type = _vtk_type_from_dtype(data_2d.dtype)
+        payload = _dataarray_to_ascii_block(data_2d)
+        comp_attr = f' NumberOfComponents="{n_comp}"' if n_comp > 1 else ""
+        point_data_xml.append(
+            f'        <DataArray type="{vtk_type}" Name="{key}"{comp_attr} format="ascii">\n'
+            f'{payload}\n'
+            f'        </DataArray>'
+        )
+
+    cell_data_xml = []
+    for key in list(grid.cell_data.keys()):
+        data_2d, n_comp = _normalize_dataarray_for_vtk(grid.cell_data[key], n_cells, key)
+        vtk_type = _vtk_type_from_dtype(data_2d.dtype)
+        payload = _dataarray_to_ascii_block(data_2d)
+        comp_attr = f' NumberOfComponents="{n_comp}"' if n_comp > 1 else ""
+        cell_data_xml.append(
+            f'        <DataArray type="{vtk_type}" Name="{key}"{comp_attr} format="ascii">\n'
+            f'{payload}\n'
+            f'        </DataArray>'
+        )
+
+    pts = np.asarray(grid.points, dtype=np.float64)
+    if pts.shape != (n_points, 3):
+        raise ValueError(
+            f"StructuredGrid point shape mismatch: expected {(n_points, 3)}, got {pts.shape}."
+        )
+    points_payload = _dataarray_to_ascii_block(pts)
+
+    if point_data_xml:
+        point_data_block = "\n".join(["      <PointData>"] + point_data_xml + ["      </PointData>"])
+    else:
+        point_data_block = "      <PointData/>"
+
+    if cell_data_xml:
+        cell_data_block = "\n".join(["      <CellData>"] + cell_data_xml + ["      </CellData>"])
+    else:
+        cell_data_block = "      <CellData/>"
+
+    xml_text = (
+        '<?xml version="1.0"?>\n'
+        '<VTKFile type="StructuredGrid" version="0.1" byte_order="LittleEndian">\n'
+        f'  <StructuredGrid WholeExtent="{extent}">\n'
+        f'    <Piece Extent="{extent}">\n'
+        f'{point_data_block}\n'
+        f'{cell_data_block}\n'
+        '      <Points>\n'
+        '        <DataArray type="Float64" NumberOfComponents="3" format="ascii">\n'
+        f'{points_payload}\n'
+        '        </DataArray>\n'
+        '      </Points>\n'
+        '    </Piece>\n'
+        '  </StructuredGrid>\n'
+        '</VTKFile>\n'
+    )
+
+    with open(vts_path, "w", encoding="utf-8") as f:
+        f.write(xml_text)
+
+
+def _write_multiblock_vtm_ascii(named_grids, out_dir, root_name):
+    os.makedirs(out_dir, exist_ok=True)
+    dataset_entries = []
+
+    for idx, (block_name, grid) in enumerate(named_grids):
+        safe_name = _sanitize_vtk_block_name(block_name)
+        vts_file = f"{root_name}_{safe_name}.vts"
+        vts_path = os.path.join(out_dir, vts_file)
+        _write_structured_grid_vts_ascii(grid, vts_path)
+        dataset_entries.append((idx, block_name, vts_file))
+
+    vtm_lines = [
+        '<?xml version="1.0"?>',
+        '<VTKFile type="vtkMultiBlockDataSet" version="1.0" byte_order="LittleEndian">',
+        '  <vtkMultiBlockDataSet>',
+    ]
+    for idx, block_name, vts_file in dataset_entries:
+        vtm_lines.append(
+            f'    <DataSet index="{idx}" name="{block_name}" file="{vts_file}"/>'
+        )
+    vtm_lines.extend([
+        '  </vtkMultiBlockDataSet>',
+        '</VTKFile>',
+        '',
+    ])
+
+    vtm_path = os.path.join(out_dir, f"{root_name}.vtm")
+    with open(vtm_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(vtm_lines))
+    return vtm_path
+
+
+
+
+def write_single_structured_cmesh_vtm(plot_dict, SIM_PATH, name="cmesh"):
+    """
+    Write a single-block structured C-mesh as a .vtm dataset.
+
+    The function expects nodal coordinate channels "X" and "Y" in plot_dict,
+    and writes all remaining same-shape channels as StructuredGrid point_data.
+
+    Output path:
+        {SIM_PATH}/constant/cmeshVTK/{name}.vtm
+    """
+    if "X" not in plot_dict or "Y" not in plot_dict:
+        raise KeyError("plot_dict must contain 'X' and 'Y' coordinate arrays.")
+
+    X = np.asarray(plot_dict["X"])
+    Y = np.asarray(plot_dict["Y"])
+
+    if X.ndim != 2 or Y.ndim != 2:
+        raise ValueError(f"X and Y must be 2D arrays, got X.ndim={X.ndim}, Y.ndim={Y.ndim}.")
+    if X.shape != Y.shape:
+        raise ValueError(f"X and Y shape mismatch: X{X.shape} vs Y{Y.shape}.")
+
+    ni, nj = X.shape
+    nk = 1
+
+    grid = pv.StructuredGrid()
+    grid.dimensions = (ni, nj, nk)
+
+    points = np.zeros((ni, nj, nk, 3), dtype=np.float64)
+    points[:, :, 0, 0] = X
+    points[:, :, 0, 1] = Y
+    grid.points = points.reshape((-1, 3), order='F')
+
+    for key, value in plot_dict.items():
+        if key in ("X", "Y"):
+            continue
+
+        arr = np.asarray(value)
+        if arr.shape[:2] != (ni, nj):
+            continue
+
+        if arr.ndim == 2:
+            grid.point_data[key] = np.asarray(arr, dtype=np.float32).ravel(order='F')
+        elif arr.ndim == 3:
+            n_comp = arr.shape[2]
+            if n_comp in (2, 3):
+                vtk_arr = np.asarray(arr, dtype=np.float32).reshape((-1, n_comp), order='F')
+                grid.point_data[key] = vtk_arr
+
+    out_dir = os.path.join(SIM_PATH, "constant", "cmeshVTK")
+    os.makedirs(out_dir, exist_ok=True)
+
+    out_path = _write_multiblock_vtm_ascii([("cmesh", grid)], out_dir, name)
+    print(f"Wrote structured C-mesh VTM: {out_path}")
+    return out_path
+
+
+def write_single_structured_orig_cmesh_vtm(master_tensor, master_x, master_y, ml_features, SIM_PATH, name="orig_cmesh"):
+    """
+    Write the original stitched C-mesh (from master tensor channels) as a
+    single-block .vtm dataset under:
+        {SIM_PATH}/constant/origCmeshVTK/{name}.vtm
+
+    Args:
+        master_tensor: np.ndarray with shape (C, ni, nj)
+        master_x: np.ndarray with shape (ni, nj)
+        master_y: np.ndarray with shape (ni, nj)
+        ml_features: list of channel names with length C
+    """
+    master_tensor = np.asarray(master_tensor)
+    master_x = np.asarray(master_x)
+    master_y = np.asarray(master_y)
+
+    if master_tensor.ndim != 3:
+        raise ValueError(f"master_tensor must be 3D [C, ni, nj], got shape={master_tensor.shape}.")
+    if master_x.ndim != 2 or master_y.ndim != 2:
+        raise ValueError(f"master_x/master_y must be 2D, got {master_x.shape} and {master_y.shape}.")
+    if master_x.shape != master_y.shape:
+        raise ValueError(f"master_x/master_y shape mismatch: {master_x.shape} vs {master_y.shape}.")
+
+    c, ni, nj = master_tensor.shape
+    if master_x.shape != (ni, nj):
+        raise ValueError(
+            f"Coordinate shape {master_x.shape} incompatible with master_tensor spatial shape {(ni, nj)}."
+        )
+    if len(ml_features) != c:
+        raise ValueError(f"ml_features length {len(ml_features)} must match channel count {c}.")
+
+    grid = pv.StructuredGrid()
+    grid.dimensions = (ni, nj, 1)
+
+    points = np.zeros((ni, nj, 1, 3), dtype=np.float64)
+    points[:, :, 0, 0] = master_x
+    points[:, :, 0, 1] = master_y
+    grid.points = points.reshape((-1, 3), order='F')
+
+    for idx, channel_name in enumerate(ml_features):
+        grid.point_data[channel_name] = np.asarray(master_tensor[idx], dtype=np.float32).ravel(order='F')
+
+    out_dir = os.path.join(SIM_PATH, "constant", "origCmeshVTK")
+    os.makedirs(out_dir, exist_ok=True)
+
+    out_path = _write_multiblock_vtm_ascii([("orig_cmesh", grid)], out_dir, name)
+    print(f"Wrote original stitched C-mesh VTM: {out_path}")
+    return out_path
+
+
+def write_stitched_raw_subgrids_vtm(
+    subgrids_or_merged,
+    SIM_PATH,
+    name="stitched_cmesh_raw",
+    fields_to_include=None,
+    output_subdir="origCmeshVTK",
+    z_ref=0.0,
+):
+    """
+    Write stitched raw C-mesh to VTM.
+
+    Accepts either:
+      1) chain-ordered list of (name, StructuredGrid) blocks, or
+      2) a pre-merged StructuredGrid.
+    """
+    if isinstance(subgrids_or_merged, pv.StructuredGrid):
+        merged = subgrids_or_merged
+    elif isinstance(subgrids_or_merged, (list, tuple)):
+        merged = concatenate_blocks(list(subgrids_or_merged), z_ref=z_ref)
+    else:
+        raise TypeError(
+            "subgrids_or_merged must be a StructuredGrid or list of (name, StructuredGrid) tuples"
+        )
+
+    if fields_to_include is not None:
+        keep = set(fields_to_include)
+        for key in list(merged.point_data.keys()):
+            if key not in keep:
+                merged.point_data.remove(key)
+        for key in list(merged.cell_data.keys()):
+            if key not in keep:
+                merged.cell_data.remove(key)
+
+    out_dir = os.path.join(SIM_PATH, "constant", output_subdir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    out_path = _write_multiblock_vtm_ascii([("stitched_raw_cmesh", merged)], out_dir, name)
+    print(f"Wrote stitched raw C-mesh VTM: {out_path}")
+    return out_path
+
+
+def write_sampled_blocks_vtm(
+    sampled_subgrids,
+    SIM_PATH,
+    name="sampled_blockmesh_fields",
+    fields_to_include=None,
+    output_subdir="origCmeshVTK",
+):
+    """
+    Export per-block sampled StructuredGrids to a single MultiBlock VTM.
+
+    Each block keeps the original blockMesh topology and may carry sampled field
+    data, so sampling quality can be inspected block-by-block in ParaView.
+    """
+    keep = set(fields_to_include) if fields_to_include is not None else None
+    named_grids = []
+
+    for block_name, grid in sampled_subgrids:
+        g = grid.copy()
+        if keep is not None:
+            for key in list(g.point_data.keys()):
+                if key not in keep:
+                    g.point_data.remove(key)
+            for key in list(g.cell_data.keys()):
+                if key not in keep:
+                    g.cell_data.remove(key)
+        named_grids.append((block_name, g))
+
+    out_dir = os.path.join(SIM_PATH, "constant", output_subdir)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = _write_multiblock_vtm_ascii(named_grids, out_dir, name)
+    print(f"Wrote possibly sampled block-level VTM to ASCII files: {out_path}")
+    return out_path
+
+
+def _parse_vtk_extent(extent_text):
+    values = [int(token) for token in extent_text.split()]
+    if len(values) != 6:
+        raise ValueError(f"Expected 6 integers in VTK extent, got: {extent_text!r}")
+    i0, i1, j0, j1, k0, k1 = values
+    return i0, i1, j0, j1, k0, k1
+
+
+def _structured_grid_dimensions_from_extent(extent_text):
+    i0, i1, j0, j1, k0, k1 = _parse_vtk_extent(extent_text)
+    return (i1 - i0 + 1, j1 - j0 + 1, k1 - k0 + 1)
+
+
+def read_ascii_structured_grid_from_vts(vts_path):
+    """
+    Read an ASCII VTS StructuredGrid directly from XML without using pv.read.
+
+    This loader is intentionally narrow in scope: it reads the point coordinates
+    from the <Points><DataArray ... format="ascii"> section and builds a
+    pyvista.StructuredGrid from those coordinates.
+    """
+    root = ET.parse(vts_path).getroot()
+    if root.tag != "VTKFile":
+        raise ValueError(f"Unexpected root tag {root.tag!r} in {vts_path}")
+    if root.attrib.get("type") != "StructuredGrid":
+        raise ValueError(f"{vts_path} is not a StructuredGrid VTS file.")
+
+    structured = root.find("StructuredGrid")
+    if structured is None:
+        raise ValueError(f"Missing <StructuredGrid> in {vts_path}")
+
+    piece = structured.find("Piece")
+    if piece is None:
+        raise ValueError(f"Missing <Piece> in {vts_path}")
+    if "Extent" not in piece.attrib:
+        raise ValueError(f"Missing Piece Extent in {vts_path}")
+
+    dimensions = _structured_grid_dimensions_from_extent(piece.attrib["Extent"])
+    points_node = piece.find("Points")
+    if points_node is None:
+        raise ValueError(f"Missing <Points> section in {vts_path}")
+
+    data_array = points_node.find("DataArray")
+    if data_array is None:
+        raise ValueError(f"Missing point DataArray in {vts_path}")
+    if data_array.attrib.get("format") != "ascii":
+        raise ValueError(
+            f"Only ASCII point DataArray is supported, got format={data_array.attrib.get('format')!r} in {vts_path}"
+        )
+
+    n_comp = int(data_array.attrib.get("NumberOfComponents", "1"))
+    if n_comp != 3:
+        raise ValueError(f"Expected 3 point components in {vts_path}, got {n_comp}")
+
+    raw_text = data_array.text or ""
+    points = np.fromstring(raw_text, sep=" ", dtype=np.float64)
+    expected_values = dimensions[0] * dimensions[1] * dimensions[2] * 3
+    if points.size != expected_values:
+        raise ValueError(
+            f"Point count mismatch in {vts_path}: expected {expected_values} values, got {points.size}"
+        )
+
+    grid = pv.StructuredGrid()
+    grid.dimensions = dimensions
+    grid.points = points.reshape((-1, 3))
+    return grid
+
+
+def read_structured_grids_from_vtm_ascii_vts(vtm_path):
+    """
+    Read a blockMesh-style VTM index and load each referenced ASCII VTS block.
+
+    The VTM file is treated only as an index of block names to .vts files.
+    Each block is then parsed directly from XML using
+    read_ascii_structured_grid_from_vts().
+    """
+    root = ET.parse(vtm_path).getroot()
+    if root.tag != "VTKFile":
+        raise ValueError(f"Unexpected root tag {root.tag!r} in {vtm_path}")
+    if root.attrib.get("type") != "vtkMultiBlockDataSet":
+        raise ValueError(f"{vtm_path} is not a vtkMultiBlockDataSet VTM file.")
+
+    multiblock = root.find("vtkMultiBlockDataSet")
+    if multiblock is None:
+        raise ValueError(f"Missing <vtkMultiBlockDataSet> in {vtm_path}")
+
+    base_dir = os.path.dirname(vtm_path)
+    grids = []
+    print(f"\nLoaded VTM index: {vtm_path}")
+
+    for dataset in multiblock.findall("DataSet"):
+        file_name = dataset.attrib.get("file")
+        if not file_name:
+            continue
+        name = dataset.attrib.get("name") or os.path.splitext(os.path.basename(file_name))[0]
+        vts_path = os.path.join(base_dir, file_name)
+        grid = read_ascii_structured_grid_from_vts(vts_path)
+        print(
+            f"  Loaded StructuredGrid '{name}' from ASCII VTS  dims={grid.dimensions}  "
+            f"pts={grid.n_points}  cells={grid.n_cells}"
+        )
+        grids.append((name, grid))
+
+    if not grids:
+        raise ValueError(f"No VTS blocks referenced in {vtm_path}")
+    return grids
 
 def read_structured_grids_from_vtm(vtm_path):
-    """Reads a VTM file and returns a list of all StructuredGrids found."""
-    mb = pv.read(vtm_path)
-    print(f"\nLoaded: {vtm_path}")
-    print(f"Top-level type : {type(mb).__name__}")
-    print(f"Top-level blocks: {mb.n_blocks}\n")
-
-    def collect_structured_grids(mb, results=None):
-        if results is None:
-            results = []
-        for i in range(mb.n_blocks):
-            child = mb[i]
-            if isinstance(child, pv.StructuredGrid):
-                name = mb.get_block_name(i) or str(i)
-                print(f"  Found StructuredGrid '{name}'  dims={child.dimensions}  "
-                      f"pts={child.n_points}  cells={child.n_cells}")
-                results.append((name, child))
-            elif isinstance(child, pv.MultiBlock):
-                collect_structured_grids(child, results)
-        return results
-
-    grids = collect_structured_grids(mb)
+    """Reads a blockMesh-style VTM file and returns all StructuredGrids found."""
+    grids = read_structured_grids_from_vtm_ascii_vts(vtm_path)
     if not grids:
         raise ValueError("No StructuredGrids found in the VTM file.")
     print(f"\nTotal structured grids found: {len(grids)}")
+
+    # Debug print successive j-line deltas at i=0 and i=max for block_5.
+    print("Debug: Block 'block_5' successive j-line deltas at i=0 and i=max:")
+    for name, grid in grids:
+        if name == "block_5":
+            ni, nj, nk = grid.dimensions
+            pts3d = np.asarray(grid.points).reshape((ni, nj, nk, 3), order='F')
+            max_j = min(6, nj - 1)
+            for j in range(max_j):
+                p_i0_a = pts3d[0, j, 0, :]
+                p_i0_b = pts3d[0, j + 1, 0, :]
+                p_imax_a = pts3d[ni - 1, j, 0, :]
+                p_imax_b = pts3d[ni - 1, j + 1, 0, :]
+                delta_i0 = np.linalg.norm(p_i0_b - p_i0_a)
+                delta_imax = np.linalg.norm(p_imax_b - p_imax_a)
+                print(
+                    f"Block '{name}' j={j}->{j + 1}: "
+                    f"|pti0_b | = {p_i0_b }, "
+                    f"pti0_a | = {p_i0_a }, "
+                    f"|delta at i=0| = {delta_i0:.12e}, "
+                    f"pimax_b | = {p_imax_b }, "
+                    f"pimax_a | = {p_imax_a }, "
+                    f"|delta at i=max| = {delta_imax:.12e}"
+                )
+
+
     return grids
 
-def read_openfoam_results(foam_path):
+def read_openfoam_results(foam_path, fields_to_keep=['U','p','nut','wallShearStress']):
     """Reads an OpenFOAM case and returns the MultiBlock dataset at the last time step."""
     reader = pv.POpenFOAMReader(foam_path)
+
+
+    # 2. Disable ALL arrays to prevent reading unwanted .gz files
+    reader.disable_all_cell_arrays()
+    reader.disable_all_point_arrays()
+    # Need to enable patch arrays otherwise 0 blocks are read, 
     reader.enable_all_patch_arrays()
+     
+    # 3. Selectively enable only the fields you care about
+    for field in fields_to_keep:
+        # OpenFOAM data usually lives in cell arrays, but we enable both to be safe
+        reader.enable_cell_array(field)
+        reader.enable_point_array(field)
+        if hasattr(reader, 'enable_patch_array'):
+            reader.enable_patch_array(field)
+        print(f"Enabled field '{field}' for reading.")
+
     # Skip time 0 — initial conditions use $variable substitution that PyVista
     # cannot parse. Read only the final (solved) time step instead.
     times = reader.time_values
     print(f"Available time steps: {times}")
     reader.set_active_time_value(times[-1])
     print(f"Reading time step: {times[-1]}")
-    mesh = reader.read()
+    mesh = reader.read()  # Use the reader to get Multiblock unstructured mesh
     print(f"\nLoaded: {foam_path}")
     print(f"Dataset type  : {type(mesh).__name__}")
     print(f"Number of blocks: {mesh.n_blocks}")
+
+
 
     def print_block(mb, indent=0):
         prefix = "  " * indent
@@ -58,7 +534,64 @@ def read_openfoam_results(foam_path):
                 print(f"{prefix}[{i}] '{name}'  type={type(child).__name__}  "
                       f"pts={child.n_points}  cells={child.n_cells}  arrays={arrays}")
 
+    def find_named_block(mb, target_name):
+        for i in range(mb.n_blocks):
+            name = mb.get_block_name(i) or str(i)
+            child = mb[i]
+            if child is None:
+                continue
+            if name == target_name:
+                return child
+            if isinstance(child, pv.MultiBlock):
+                result = find_named_block(child, target_name)
+                if result is not None:
+                    return result
+        return None
+
+    def count_block_sizes(mb):
+        if not isinstance(mb, pv.MultiBlock):
+            return int(getattr(mb, "n_points", 0)), int(getattr(mb, "n_cells", 0))
+        total_points = 0
+        total_cells = 0
+        for i in range(mb.n_blocks):
+            child = mb[i]
+            if child is None:
+                continue
+            if isinstance(child, pv.MultiBlock):
+                p, c = count_block_sizes(child)
+                total_points += p
+                total_cells += c
+            else:
+                total_points += int(getattr(child, "n_points", 0))
+                total_cells += int(getattr(child, "n_cells", 0))
+        return total_points, total_cells
+
     print_block(mesh)
+    internal_mesh = find_named_block(mesh, "internalMesh")
+    if internal_mesh is None:
+        raise ValueError("Could not find 'internalMesh' in OpenFOAM reader output.")
+
+    print(" Using only 'internalMesh' and ignoring boundary patches before combine.")
+    print(" Now combining internalMesh into a single mesh for interpolation...this is slow for large meshes.")
+    pre_combine_points, pre_combine_cells = count_block_sizes(internal_mesh)
+    print(f" Number of points before combining: {pre_combine_points}  cells before combining: {pre_combine_cells}")
+    if isinstance(internal_mesh, pv.MultiBlock):
+        mesh = internal_mesh.combine(merge_points=True, tolerance=1e-11)
+    else:
+        mesh = internal_mesh.copy()
+    post_combine_points = mesh.n_points
+    post_combine_cells = mesh.n_cells
+
+    print(f" Number of points after combining: {post_combine_points}  cells after combining: {post_combine_cells}")
+    print(f" Change in points: {post_combine_points - pre_combine_points}  change in cells: {post_combine_cells - pre_combine_cells}    ")
+    print(" Converting cell data to point data for smooth interpolation...")
+    mesh = mesh.cell_data_to_point_data()
+
+    
+
+
+
+    print(f" Finished reading and merging OpenFOAM results.  {foam_path}")
     return mesh
 
 
@@ -281,14 +814,14 @@ def concatenate_blocks_ml_tensor(resampled_blocks: dict, BLOCK_ORDER):
         d = b['data']  # [Channels, Ni, Nj]
         x = b['x']     # [Ni, Nj]
         y = b['y']     # [Ni, Nj]
-        w = b['wss']   # [Ni]
+        w = b['w'][:2, :]   # [Ni]  for wall shear stress in X,Y directions (take only first 2 channels if w has more)
         
         # Deduplication: Drop the last i-node for every block EXCEPT the final wake block
         if i < len(BLOCK_ORDER) - 1:
             data_parts.append(d[:, :-1, :])
             x_parts.append(x[:-1, :])
             y_parts.append(y[:-1, :])
-            w_parts.append(w[:-1])
+            w_parts.append(w[:, :-1]) # <-- Slice axis 1, not axis 0
         else:
             data_parts.append(d)
             x_parts.append(x)
@@ -306,7 +839,7 @@ def concatenate_blocks_ml_tensor(resampled_blocks: dict, BLOCK_ORDER):
     print(f"Total i-nodes (Y-coord): {final_y.shape[0]}  (Target: 1024)") 
     print(f"Total i-nodes (WSS): {final_w.shape[1]}  (Target: 1024)")
 
-    return final_data, final_x, final_y,final_w
+    return final_data, final_x, final_y, final_w
 
 
 
@@ -438,7 +971,7 @@ def extract_arrays(subgrid, feature_list):
         
     return data, X, Y
 
-def resample_block_pchip(block_data, block_x, block_y, target_ni=256):
+def resample_block_pchip(block_data, block_x, block_y, target_ni=256, block_name="Unknown"):
     """
     block_data: [Channels, Ni, Nj]
     block_x, block_y: [Ni, Nj]
@@ -446,35 +979,251 @@ def resample_block_pchip(block_data, block_x, block_y, target_ni=256):
     """
     C, Ni, Nj = block_data.shape
     
-    # We use 'computational space' (index fraction from 0 to 1)
+    # --- 1. ROBUST CLEANING WITH DEBUGGING ---
+    for j in range(Nj):
+        # A. COORDINATE CHECK
+        for name, coord in [("X", block_x), ("Y", block_y)]:
+            mask = ~np.isfinite(coord[:, j])
+            if mask.any():
+                num_bad = mask.sum()
+                if mask.all():
+                    print(f"❌ CRITICAL: {block_name} - {name} coord at j={j} is ENTIRELY non-finite!")
+                else:
+                    print(f"⚠️ DEBUG: {block_name} - {name} coord has {num_bad}/{Ni} NaNs at j={j}. Patching...")
+                    idx = np.arange(Ni)
+                    coord[mask, j] = np.interp(idx[mask], idx[~mask], coord[~mask, j])
+
+        # B. FLOW CHANNEL CHECK
+        for c in range(C):
+            mask = ~np.isfinite(block_data[c, :, j])
+            if mask.any():
+                num_bad = mask.sum()
+                if mask.all():
+                    # If the entire row is NaN, interpolation is impossible
+                    print(f"🔥 FATAL: {block_name} - Channel {c} at j={j} is 100% NaN. PCHIP will fail.")
+                else:
+                    print(f"⚠️ DEBUG: {block_name} - Channel {c} has {num_bad}/{Ni} NaNs at j={j}. Patching...")
+                    idx = np.arange(Ni)
+                    block_data[c, mask, j] = np.interp(idx[mask], idx[~mask], block_data[c, ~mask, j])
+
+    # --- 2. PCHIP INTERPOLATION ---
+    # (Rest of the function remains the same)
     old_s = np.linspace(0, 1, Ni)
     new_s = np.linspace(0, 1, target_ni)
-    
-    # Initialize output arrays
     new_data = np.zeros((C, target_ni, Nj), dtype=np.float32)
-    new_x = np.zeros((target_ni, Nj), dtype=np.float32)
-    new_y = np.zeros((target_ni, Nj), dtype=np.float32)
-    
-    # Interpolate J-layer by J-layer (Zero vertical bleeding)
-    for j in range(Nj):
-        # 1. Resample coordinates (Preserves LE clustering)
-        interp_x = PchipInterpolator(old_s, block_x[:, j])
-        interp_y = PchipInterpolator(old_s, block_y[:, j])
-        new_x[:, j] = interp_x(new_s)
-        new_y[:, j] = interp_y(new_s)
-        
-        # 2. Resample flow channels
-        for c in range(C):
-            interp_c = PchipInterpolator(old_s, block_data[c, :, j])
-            new_data[c, :, j] = interp_c(new_s)
-            
+    new_x, new_y = np.zeros((target_ni, Nj)), np.zeros((target_ni, Nj))
+
+    try:
+        for j in range(Nj):
+            new_x[:, j] = PchipInterpolator(old_s, block_x[:, j])(new_s)
+            new_y[:, j] = PchipInterpolator(old_s, block_y[:, j])(new_s)
+            for c in range(C):
+                new_data[c, :, j] = PchipInterpolator(old_s, block_data[c, :, j])(new_s)
+    except ValueError as e:
+        print(f"💥 PCHIP CRASHED in {block_name}: {e}")
+        # Hint: This usually happens if old_s or the data contains NaNs after cleaning
+        raise
+
     return new_data, new_x, new_y
 
+def extract_and_resample_wss(block_subgrid, target_ni):
+    """
+    Extracts wallShearStress from the j=0 wall and resamples it 
+    to match the new 1024 topology.
+    """
+    ni, nj, nk = block_subgrid.dimensions
+    
+    # 1. Grab the raw WSS vector field (usually X, Y, Z components)
+    if 'wallShearStress' not in block_subgrid.point_data:
+        # If this is a wake block with no wall, just return zeros
+        return np.zeros((3, target_ni), dtype=np.float32)
+        
+    wss_flat = block_subgrid.point_data['wallShearStress']
+    
+    # 2. Reshape to (Ni, Nj, 3 components) and slice strictly at j=0
+    wss_2d = wss_flat.reshape((ni, nj, nk, 3), order='F')[:, :, 0, :]
+    wss_wall_true_length = wss_2d[:, 0, :] # Shape: [Ni, 3]
+    
+    # 3. 1D PCHIP to the target length
+    old_s = np.linspace(0, 1, ni)
+    new_s = np.linspace(0, 1, target_ni)
+    
+    wss_resampled = np.zeros((3, target_ni), dtype=np.float32)
+    for comp in range(3): # For X, Y, Z shear components
+        interp = PchipInterpolator(old_s, wss_wall_true_length[:, comp])
+        wss_resampled[comp, :] = interp(new_s)
+        
+    return wss_resampled
+
+
+
+def calculate_and_append_sdf(master_tensor, master_x, master_y, k=0.5):
+    """
+    Calculates the SDF using the NumPy coordinate grids and appends 
+    exp_sdf as a new channel to the master_tensor.
+    """
+    print("\nCalculating SDF on the 1024x216 master grid...")
+    wake_length_start = 128
+    airfoil_start = wake_length_start
+    airfoil_end = 1024 - 127 # Exclude the trailing wake block
+    # 1. Extract the Wall Coordinates
+    # In your stitched topology, the wall is strictly at index j=0
+    wall_x = master_x[airfoil_start:airfoil_end, 0]  # Shape: (1024,)
+    wall_y = master_y[airfoil_start:airfoil_end, 0]  # Shape: (1024,)
+    wall_xy = np.column_stack((wall_x, wall_y)) # Shape: (1024, 2)
+    
+    # 2. Flatten all coordinates for the KDTree query
+    all_x = master_x.flatten()
+    all_y = master_y.flatten()
+    all_xy = np.column_stack((all_x, all_y))    # Shape: (221184, 2)
+    
+    # 3. Query the KDTree
+    tree = KDTree(wall_xy)
+    sdf_flat, _ = tree.query(all_xy, workers=-1)
+    
+    # 4. Reshape back to the 2D spatial grid
+    sdf_2d = sdf_flat.reshape(master_x.shape)   # Shape: (1024, 216)
+    sdf_fixed = np.nan_to_num(sdf_2d, nan=0.0).astype(np.float32)
+    
+    # 5. Calculate the Exponential SDF
+    exp_sdf_2d = np.exp(-k * sdf_fixed).astype(np.float32)
+    
+    print(f"SDF Range: min={sdf_fixed.min():.6f}, max={sdf_fixed.max():.6f}, mean={sdf_fixed.mean():.6f}")
+    print(f"Exp_SDF Range: min={exp_sdf_2d.min():.6f}, max={exp_sdf_2d.max():.6f}")
+    
+    # 6. Append exp_sdf to the master_tensor
+    # We add a dummy channel dimension [1, 1024, 216] so it concatenates properly
+    exp_sdf_expanded = np.expand_dims(exp_sdf_2d, axis=0)
+    master_tensor_updated = np.concatenate([master_tensor, exp_sdf_expanded], axis=0)
+    
+    print(f"Updated Master Tensor Shape: {master_tensor_updated.shape}")
+    
+    return master_tensor_updated, sdf_fixed, exp_sdf_2d
+
+
+def debug_plot_raw_blocks(blocks_dict):
+    """Plots the raw, un-interpolated data from specific blocks to find artifacts."""
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # Let's look at the beginning of the wake (Block 0) 
+    # and the end of the wake (Block 1)
+    for i, b_name in enumerate(['block_0', 'block_1']):
+        block = blocks_dict[b_name]
+        # Extract raw nut or U_x from the vtk/pyvista object
+        # Using .point_data if you've already moved it there, or .cell_data
+        raw_val = block.point_data['U_of_x'].reshape(block.dimensions[0], block.dimensions[1])
+        
+        im = axes[i].imshow(raw_val.T, origin='lower', aspect='auto', cmap='jet')
+        axes[i].set_title(f"RAW {b_name} - U_x")
+        plt.colorbar(im, ax=axes[i])
+        
+    plt.tight_layout()
+    plt.show()
+
+def debug_te_junction(sampled_blocks):
+    """Inspects the TE transition between airfoil blocks and wake blocks."""
+    # Airfoil ends at the end of block_5 (lower) and starts at the beginning of block_4 (upper)
+    # The wake starts at block_0 and ends at block_1
+    
+    print("\n--- Trailing Edge Junction Debug ---")
+    
+    # Check Lower TE (Block 5 end vs Block 0 start)
+    b5_end_u = sampled_blocks['block_5']['data'][ML_FEATURES.index("U_of_x"), -1, 0]
+    b0_start_u = sampled_blocks['block_0']['data'][ML_FEATURES.index("U_of_x"), 0, 0]
+    
+    # Check Upper TE (Block 4 start vs Block 1 end)
+    b4_start_u = sampled_blocks['block_4']['data'][ML_FEATURES.index("U_of_x"), 0, 0]
+    b1_end_u = sampled_blocks['block_1']['data'][ML_FEATURES.index("U_of_x"), -1, 0]
+
+    print(f"Lower TE Junction: Block_5_end={b5_end_u:.4f} | Block_0_start={b0_start_u:.4f}")
+    print(f"Upper TE Junction: Block_4_start={b4_start_u:.4f} | Block_1_end={b1_end_u:.4f}")
+    
+    if abs(b5_end_u - b0_start_u) > 1e-3:
+        print("!!! ALERT: Discontinuity detected at Lower Trailing Edge!")
+
+from scipy.spatial import cKDTree
+import numpy as np
+import matplotlib.pyplot as plt
+
+def plot_geometric_drift(foam_mesh, vts_blocks_dict, block_names):
+    print("\nBuilding KDTree for OpenFOAM points...")
+    # Create a fast search tree of the true 64-bit OpenFOAM coordinates
+    tree = cKDTree(foam_mesh.points)
+    
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle("Geometric Drift (VTS vs OpenFOAM) - Absolute Distance", fontsize=16)
+    axes = axes.flatten()
+    
+    for i, name in enumerate(block_names):
+        ax = axes[i]
+        block = vts_blocks_dict[name]
+        ni, nj, nk = block.dimensions
+        
+        # 1. Find the nearest OpenFOAM node for every VTS node
+        distances, nearest_indices = tree.query(block.points, k=1)
+        
+        # 2. Extract the exact matching OpenFOAM coordinates
+        foam_nearest_pts = foam_mesh.points[nearest_indices]
+        
+        # 3. Calculate exact dx and dy (if you want to inspect directional drift)
+        dx = block.points[:, 0] - foam_nearest_pts[:, 0]
+        dy = block.points[:, 1] - foam_nearest_pts[:, 1]
+        
+        # We will plot the absolute magnitude of the drift (distances)
+        # CRITICAL: Use Fortran ordering to match your grid!
+        error_3d = distances.reshape((ni, nj, nk), order='F')
+        error_2d = error_3d[:, :, 0]
+        
+        # Plot the error heatmap
+        im = ax.imshow(error_2d.T, origin='lower', aspect='auto', cmap='magma')
+        
+        # Print the max error in the title
+        ax.set_title(f"{name} Max Drift: {error_2d.max():.2e} m")
+        plt.colorbar(im, ax=ax)
+        
+    plt.tight_layout()
+    plt.show()
+
+
+
+def plot_block_scalar(raw_vtk_blocks, BLOCK_ORDER,scalar_name='U_of_x'):
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(f"Raw VTK Block Data - {scalar_name}", fontsize=16)
+    axes = axes.flatten()
+
+    for i, name in enumerate(BLOCK_ORDER):
+        ax = axes[i]
+        block = raw_vtk_blocks[name]
+        # 1. Grab the correct dimensions for THIS specific block first!
+        ni, nj, nk = block.dimensions
+        # Extract coordinates (slice the first Z-plane)
+        block_x = block.points[:, 0].reshape(ni, nj, nk)[:, :, 0]
+        block_y = block.points[:, 1].reshape(ni, nj, nk)[:, :, 0]
+        
+        # Reshape the 1D point data back to the grid dimensions
+        ni, nj, nk = block.dimensions
+        print(f"Plotting raw data for '{name}' with dimensions (ni={ni}, nj={nj}, nk={nk})")
+        # Let's look at U_of_x or nut to find that artifact
+        data_3d = block.point_data[scalar_name].reshape(ni, nj, nk, order='F')
+        data_2d = data_3d[:, :, 0]
+
+        # Use pcolormesh with the block's own X,Y to see it in physical space
+        # (Or imshow(data_2d.T) to see it in latent space)
+        im = ax.imshow(data_2d.T, origin='lower', aspect='auto', cmap='turbo')
+        ax.set_title(f"{name} (ni={ni}, nj={nj})")
+        fig.colorbar(im, ax=ax)
+
+    fig.tight_layout()
+    plt.show()
+    plt.close(fig)
 
 if __name__ == "__main__":
 
-    SIM_PATH = "/home/timm/Projects/PIML/OF_dataset/airFoil2D_SST_31.68_0.424_0.273_4.301_1.0_11.616"
+    AF_ROOT = "/home/timm/Projects/PIML/Dataset"
 
+    SIM_PATH = "/home/timm/storage/AF_NO_DATASET/OF_dataset/airFoil2D_SST_87.491_11.397_2.605_5.288_1.0_15.864"
+    sim_name = os.path.basename(SIM_PATH)
     VTM_PATH = f"{SIM_PATH}/constant/blockMeshVTK/blockMesh.vtm"
     FOAM_PATH = f"{SIM_PATH}/touch.foam"
 
@@ -484,17 +1233,26 @@ if __name__ == "__main__":
 
     if not os.path.exists(FOAM_PATH):
         os.system(f"touch {FOAM_PATH}")  # create empty file to satisfy PyVista reader
+    
+    simulation = af.Simulation(root=AF_ROOT, name=sim_name)
+    U_inf = simulation.inlet_velocity
+    nu = simulation.NU
+    rho = simulation.RHO
+    reynolds = rho * U_inf / nu
 
-
-    foam_results = read_openfoam_results(FOAM_PATH)
+    foam_combined = read_openfoam_results(FOAM_PATH)
 
     # Merge all OpenFOAM blocks into one UnstructuredGrid so we can call .interpolate()
     # use_all_points=True keeps ghost/boundary points; progress_bar for large meshes
-    foam_combined = foam_results.combine(merge_points=True)
+    print("\nMerging OpenFOAM blocks into a single mesh for interpolation...")
     print(f"\nCombined OpenFOAM mesh: type={type(foam_combined).__name__}  "
           f"pts={foam_combined.n_points}  cells={foam_combined.n_cells}")
     print(f"Available arrays: {foam_combined.array_names}")
 
+    foam_combined["Cp"] = foam_combined["p"] / (0.5 * U_inf**2)  # Note no rho because incompressible Openfoam results 
+    foam_combined["nut_ratio_cube_root"] = np.cbrt(foam_combined["nut"]+1e-12 / nu)
+    foam_combined["U_of_x"] = foam_combined["U"][:, 0]  # X-component of velocity
+    foam_combined["U_of_y"] = foam_combined["U"][:, 1]  # Y-component of velocity
     grids = read_structured_grids_from_vtm(VTM_PATH)
 
     # Physical traversal order around the C-mesh (clockwise, i increases along chain):
@@ -506,22 +1264,24 @@ if __name__ == "__main__":
     #   block_1 → wake (back, away from TE)
     BLOCK_ORDER = ['block_0', 'block_3', 'block_5', 'block_4', 'block_2', 'block_1']
     grid_by_name = {name: grid for name, grid in grids}
-
-    # need only first 158 points in j direction to cover cartesian domain used in Airfrans data
-    # extract_subset takes a single flat extent: [i_min, i_max, j_min, j_max, k_min, k_max]
-    J_MAX = 158
-    I0_min = 58
-    I1_max = 225 - I0_min   # symmetric trim on the other wake half
+    
+    J_MAX = 216
+    # extract subgrids with correct i extents, keeping all j points up to J_MAX
+    print("\nExtracting subgrids with specified i extents and J_MAX limit...")
     subgrids_raw = []
+    num_wake_cells = 0
     for bname in BLOCK_ORDER:
         grid = grid_by_name[bname]
         ni, nj, nk = grid.dimensions
         if bname == 'block_0':
-            sub = grid.extract_subset([I0_min, ni - 1, 0, min(J_MAX, nj - 1), 0, 1])
+            sub = grid.extract_subset([0, ni - 1, 0, min(J_MAX, nj - 1), 0, 1])
+            num_wake_cells = sub.dimensions[0]  # length along i-axis
         elif bname == 'block_1':
-            sub = grid.extract_subset([I0_min, ni - 1, 0, min(J_MAX, nj - 1), 0, 1])
+            sub = grid.extract_subset([0, ni - 1, 0, min(J_MAX, nj - 1), 0, 1])
         else:
             sub = grid.extract_subset([0, ni - 1, 0, min(J_MAX, nj - 1), 0, 1])
+
+        # resample to new std block size
         subgrids_raw.append((bname, sub))
         print(f"'{bname}': {grid.dimensions} → {sub.dimensions}  "
               f"pts={sub.n_points}  cells={sub.n_cells}")
@@ -530,8 +1290,8 @@ if __name__ == "__main__":
     subgrids = chain_stitch_orientation(subgrids_raw)
 
     # Keep only the fields we need in the source mesh
-    CELL_FIELDS  = ["U", "p", "nut"]           # cell-centred → cell_data
-    POINT_FIELDS = ["p", "wallShearStress"]     # node-interpolated → point_data
+    CELL_FIELDS  = ["U", "p", "nut" , "Cp", "nut_ratio_cube_root"]           # cell-centred → cell_data
+    POINT_FIELDS = ["p", "wallShearStress", "Cp", "nut_ratio_cube_root"]     # node-interpolated → point_data
     KEEP = set(CELL_FIELDS + POINT_FIELDS)
     for arr in list(foam_combined.array_names):
         if arr not in KEEP:
@@ -540,47 +1300,110 @@ if __name__ == "__main__":
     print(f"Retained arrays in source: {foam_combined.array_names}")
 
     # ── Sample each block, compute Jacobians, collect ─────────────────────────
-    import os
-    sampled_list = []
+   # Dictionary to hold our final resampled numpy arrays for each block
+    sampled_blocks = {}
+    # 1. Initialize empty list and strict exclusions
+    ML_FEATURES = [] 
+    EXCLUDE_FROM_VOLUMETRIC = ["wallShearStress", "U"] # Must exclude the raw U vector!
+
+    raw_vtk_blocks = {}
     for name, sub in subgrids:
         print(f"Sampling '{name}'...")
 
         # Cell-centred fields: U, p, nut
-        cc = sub.cell_centers()
-        cc_sampled = cc.sample(foam_combined)
-        out = sub.copy(deep=False)
-        out.clear_data()
-        for field in CELL_FIELDS:
-            if field in cc_sampled.point_data:
-                out.cell_data[field] = cc_sampled.point_data[field]
-            else:
-                print(f"  WARNING: cell field '{field}' not found for '{name}'")
+        #cc = sub.cell_data Old way 
+        #  # Convert to point data for sampling
+        sub = sub.cell_data_to_point_data()
+        sub_sampled = sub.sample(foam_combined,snap_to_closest_point=True)
 
-        # Node fields: p, wallShearStress
-        pts_sampled = sub.sample(foam_combined)
-        for field in POINT_FIELDS:
-            if field in pts_sampled.point_data:
-                out.point_data[field] = pts_sampled.point_data[field]
-            else:
-                print(f"  WARNING: point field '{field}' not found for '{name}'")
 
-        # Jacobian metric tensor
-        jac = compute_jacobian_metrics(sub)
-        for key, arr in jac.items():
-            out.cell_data[key] = arr
+        # Split the velocity vector into explicit scalar fields
+        if 'U' in sub_sampled.point_data:
+            sub_sampled.point_data['U_of_x'] = sub_sampled.point_data['U'][:, 0]
+            sub_sampled.point_data['U_of_y'] = sub_sampled.point_data['U'][:, 1]
+        # Define the EXACT order of your volumetric channels
+        # (This order becomes the channel indices of your master_tensor)
 
-        sampled_list.append((name, out))
+        # Jacobian metric tensors at both points and cell centres for physics-informed interpolation
+        jac_point,jac_center = compute_jacobian_metrics(sub)
+        
+     
+        # Store the actual PyVista object 'out' before it gets converted to a numpy array
+        raw_vtk_blocks[name] = sub_sampled.copy()
+    # --- NEW PLOTTING BLOCK FOR RAW DIAGNOSIS ---
 
-    # ── Concatenate into a single StructuredGrid and save ─────────────────────
-    print("\nConcatenating blocks along i-axis...")
-    merged = concatenate_blocks(sampled_list, z_ref=0.0)
-    if output_type =='vts':
-        os.makedirs(OUT_DIR, exist_ok=True)
-        out_path = os.path.join(OUT_DIR, "airfoil_cmesh.vts")
-        merged.save(out_path)
-        print(f"Saved '{out_path}'  "
-            f"dims={merged.dimensions}  "
-            f"cell_data={list(merged.cell_data.keys())}  "
-            f"point_data={list(merged.point_data.keys())}")
-    elif output_type == 'pt':
-        pass
+    plot_geometric_drift(foam_combined, raw_vtk_blocks, BLOCK_ORDER)
+
+    plot_block_scalar(raw_vtk_blocks, BLOCK_ORDER,scalar_name='U_of_x')
+    plot_block_scalar(raw_vtk_blocks, BLOCK_ORDER,scalar_name='U_of_y')
+    plot_block_scalar(raw_vtk_blocks, BLOCK_ORDER,scalar_name='Cp')
+    plot_block_scalar(raw_vtk_blocks, BLOCK_ORDER,scalar_name='nut_ratio_cube_root')
+        
+    # #     for key, arr in jac_point.items():
+    # #         print(f"Adding point data '{key}' to '{name}' with shape {arr.shape} and range [{arr.min():.3e}, {arr.max():.3e}]")
+    # #         # need both z-planes
+    # #         nz = out.dimensions[2]
+    # #         arr = np.tile(arr, nz)
+    # #         out.point_data[key] = arr
+
+    # #             # Lock the dynamic feature order on the first block
+    # #     if not ML_FEATURES:
+    # #         all_keys = list(out.point_data.keys())
+    # #         # Sorting guarantees the same channel indices every single run
+    # #         ML_FEATURES = sorted([k for k in all_keys if k not in EXCLUDE_FROM_VOLUMETRIC])
+    # #         print(f"Locked in ML_FEATURES channel order: {ML_FEATURES}")   
+
+
+    # #     block_data, block_x, block_y = extract_arrays(out, ML_FEATURES)
+
+    # #             # Save to dictionary for concatenation
+    # #     sampled_blocks[name] = {
+    # #         'data': block_data, 'x': block_x, 'y': block_y
+    # #     }
+
+    # #     wss_blk = extract_and_resample_wss(sub, 1024)
+    # #     sampled_blocks[name]['w'] = wss_blk
+
+
+    # # master_tensor, master_x, master_y , master_w = concatenate_blocks_ml_tensor(sampled_blocks, BLOCK_ORDER)
+    # # k_sdf = 5.0 # Adjust this parameter to control the decay rate of the exponential SDF
+    # # master_tensor, sdf_grid, exp_sdf_grid = calculate_and_append_sdf( master_tensor, master_x, master_y, k=k_sdf )
+
+
+    # # U_of_x = master_tensor[ML_FEATURES.index("U_of_x")]
+    # # U_of_y = master_tensor[ML_FEATURES.index("U_of_y")]
+    # # p_of   = master_tensor[ML_FEATURES.index("p")]
+    # # nut_of = master_tensor[ML_FEATURES.index("nut")]
+
+
+
+    # AOA = simulation.angle_of_attack * 180 / np.pi
+    # U_inf = simulation.inlet_velocity
+    # nu = simulation.NU
+    # rho = simulation.RHO
+    # reynolds = rho * U_inf / nu
+    # log_re = np.log(reynolds)   
+
+    # # 2. Normalize OpenFOAM CFD Data
+    # U_x = U_of_x / U_inf
+    # U_y = U_of_y / U_inf
+    # Cp_of = p_of / (0.5 * U_inf**2)  # Note no rho because incompressible Openfoam results 
+    
+    # nut_eps = 1e-12
+    # nut_ratio = np.clip(nut_of / nu, nut_eps, None)
+    # nut_ratio_cuberoot = np.power(nut_ratio, 1/3).astype(np.float32)
+    
+    
+    # # Create a dictionary out of your calculated features
+    # plot_dict = {
+    #     "X": master_x,
+    #     "Y": master_y,
+    #     "Cp": Cp_of, "U_x": U_x, "U_y": U_y,
+    #     "nut": nut_of,
+    #     "nut_ratio_cuberoot": nut_ratio_cuberoot,
+    #     "sdf": sdf_grid,
+    #     "exp_sdf": exp_sdf_grid,
+
+    # }
+
+    # debug_plot_raw_blocks(plot_dict)
