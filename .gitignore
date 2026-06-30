@@ -12,6 +12,7 @@ wandb_api_key.txt
 # Local work data directories (generated outputs, not source)
 tims/**/*.png
 tims/**/*.pt
+tims/**/*.npy
 neuralop/data/datasets/data/
 
 # Byte-compiled / optimized / DLL files
