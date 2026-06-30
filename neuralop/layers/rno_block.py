@@ -49,6 +49,8 @@ class RNOCell(nn.Module):
         Stabilizing module to use between certain layers. Options: "tanh", None, by default None
     norm : Literal["ada_in", "group_norm", "instance_norm", "batch_norm"], optional
         Normalization layer to use. Options: "ada_in", "group_norm", "instance_norm", "batch_norm", None, by default None
+    norm_groups : int, optional
+        Number of groups for GroupNorm, by default 1
     ada_in_features : int, optional
         Number of features for adaptive instance norm above, by default None
     preactivation : bool, optional
@@ -79,6 +81,13 @@ class RNOCell(nn.Module):
         Implementation parameter for SpectralConv. Options: "factorized", "reconstructed", by default "factorized"
     decomposition_kwargs : dict, optional
         Kwargs for tensor decomposition in SpectralConv, by default dict()
+    enforce_hermitian_symmetry : bool, optional
+        Whether to enforce Hermitian symmetry conditions when performing inverse FFT
+        for real-valued data. Only used when ``conv_module`` is :class:`SpectralConv`
+        or a subclass; ignored otherwise. When True, explicitly enforces that the 0th
+        frequency and Nyquist frequency are real-valued before calling irfft. When False,
+        relies on cuFFT's irfftn to handle symmetry automatically, which may fail on
+        certain GPUs or input sizes, causing line artifacts. By default True.
 
     References
     ----------
@@ -98,6 +107,7 @@ class RNOCell(nn.Module):
         non_linearity=F.gelu,
         stabilizer=None,
         norm=None,
+        norm_groups=1,
         ada_in_features=None,
         preactivation=False,
         fno_skip="linear",
@@ -110,6 +120,7 @@ class RNOCell(nn.Module):
         fixed_rank_modes=False,
         implementation="factorized",
         decomposition_kwargs=dict(),
+        enforce_hermitian_symmetry=True,
     ):
         super().__init__()
         self.hidden_channels = hidden_channels
@@ -126,6 +137,7 @@ class RNOCell(nn.Module):
             "non_linearity": non_linearity,
             "stabilizer": stabilizer,
             "norm": norm,
+            "norm_groups": norm_groups,
             "preactivation": preactivation,
             "fno_skip": fno_skip,
             "channel_mlp_skip": channel_mlp_skip,
@@ -137,6 +149,7 @@ class RNOCell(nn.Module):
             "fixed_rank_modes": fixed_rank_modes,
             "implementation": implementation,
             "decomposition_kwargs": decomposition_kwargs,
+            "enforce_hermitian_symmetry": enforce_hermitian_symmetry,
         }
 
         # For super-resolution: the hidden state h is always stored at the scaled resolution,
@@ -260,6 +273,8 @@ class RNOBlock(nn.Module):
         Stabilizing module to use between certain layers. Options: "tanh", None, by default None
     norm : Literal["ada_in", "group_norm", "instance_norm", "batch_norm"], optional
         Normalization layer to use. Options: "ada_in", "group_norm", "instance_norm", "batch_norm", None, by default None
+    norm_groups : int, optional
+        Number of groups for GroupNorm, by default 1
     ada_in_features : int, optional
         Number of features for adaptive instance norm above, by default None
     preactivation : bool, optional
@@ -290,6 +305,13 @@ class RNOBlock(nn.Module):
         Implementation parameter for SpectralConv. Options: "factorized", "reconstructed", by default "factorized"
     decomposition_kwargs : dict, optional
         Kwargs for tensor decomposition in SpectralConv, by default dict()
+    enforce_hermitian_symmetry : bool, optional
+        Whether to enforce Hermitian symmetry conditions when performing inverse FFT
+        for real-valued data. Only used when ``conv_module`` is :class:`SpectralConv`
+        or a subclass; ignored otherwise. When True, explicitly enforces that the 0th
+        frequency and Nyquist frequency are real-valued before calling irfft. When False,
+        relies on cuFFT's irfftn to handle symmetry automatically, which may fail on
+        certain GPUs or input sizes, causing line artifacts. By default True.
 
     References
     ----------
@@ -310,6 +332,7 @@ class RNOBlock(nn.Module):
         non_linearity=F.gelu,
         stabilizer=None,
         norm=None,
+        norm_groups=1,
         ada_in_features=None,
         preactivation=False,
         fno_skip="linear",
@@ -322,6 +345,7 @@ class RNOBlock(nn.Module):
         fixed_rank_modes=False,
         implementation="factorized",
         decomposition_kwargs=dict(),
+        enforce_hermitian_symmetry=True,
     ):
         super().__init__()
 
@@ -341,6 +365,7 @@ class RNOBlock(nn.Module):
             non_linearity=non_linearity,
             stabilizer=stabilizer,
             norm=norm,
+            norm_groups=norm_groups,
             preactivation=preactivation,
             fno_skip=fno_skip,
             channel_mlp_skip=channel_mlp_skip,
@@ -352,6 +377,7 @@ class RNOBlock(nn.Module):
             fixed_rank_modes=fixed_rank_modes,
             implementation=implementation,
             decomposition_kwargs=decomposition_kwargs,
+            enforce_hermitian_symmetry=enforce_hermitian_symmetry,
         )
         if complex_data:
             self.bias_h = nn.Parameter(torch.randn(()) + 1j * torch.randn(()))

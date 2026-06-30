@@ -91,6 +91,8 @@ class LocalNOBlocks(nn.Module):
         Stabilizing module between layers. Options: "tanh". By default None
     norm : Literal["ada_in", "group_norm", "instance_norm"], optional
         Normalization layer to use, by default None
+    norm_groups : int, optional
+        Number of groups for GroupNorm, by default 1
     ada_in_features : int, optional
         Number of features for adaptive instance normalization, by default None
     preactivation : bool, optional
@@ -107,7 +109,7 @@ class LocalNOBlocks(nn.Module):
         If None, no skip connection is added. See layers.skip_connections for more details
 
     Other Parameters
-    ---------------
+    ----------------
     complex_data : bool, optional
         Whether the data takes complex values in space, by default False
     separable : bool, optional
@@ -127,6 +129,13 @@ class LocalNOBlocks(nn.Module):
         Implementation method for SpectralConv, by default "factorized"
     decomposition_kwargs : dict, optional
         Keyword arguments for tensor decomposition in SpectralConv, by default dict()
+    enforce_hermitian_symmetry : bool, optional
+        Whether to enforce Hermitian symmetry conditions when performing inverse FFT
+        for real-valued data. Only used when ``conv_module`` is :class:`SpectralConv`
+        or a subclass; ignored otherwise. When True, explicitly enforces that the 0th
+        frequency and Nyquist frequency are real-valued before calling irfft. When False,
+        relies on cuFFT's irfftn to handle symmetry automatically, which may fail on
+        certain GPUs or input sizes, causing line artifacts. By default True.
 
     Notes
     -----
@@ -171,6 +180,7 @@ class LocalNOBlocks(nn.Module):
         non_linearity=F.gelu,
         stabilizer=None,
         norm=None,
+        norm_groups=1,
         ada_in_features=None,
         preactivation=False,
         local_no_skip="linear",
@@ -183,6 +193,7 @@ class LocalNOBlocks(nn.Module):
         implementation="factorized",
         decomposition_kwargs=dict(),
         fft_norm="forward",
+        enforce_hermitian_symmetry=True,
     ):
         super().__init__()
         if isinstance(n_modes, int):
@@ -233,6 +244,7 @@ class LocalNOBlocks(nn.Module):
         self.separable = separable
         self.preactivation = preactivation
         self.ada_in_features = ada_in_features
+        self.enforce_hermitian_symmetry = enforce_hermitian_symmetry
 
         self.diff_layers = diff_layers
         self.conv_padding_mode = conv_padding_mode
@@ -257,13 +269,19 @@ class LocalNOBlocks(nn.Module):
         ), f"disco_layers must either provide a single bool value or a list of booleans of length n_layers,\
                     got {len(disco_layers)=}"
 
+        # One conv per layer. Only resolution_scaling_factor varies by layer index
         self.convs = nn.ModuleList(
             [
                 conv_module(
                     self.in_channels,
                     self.out_channels,
                     self.n_modes,
-                    resolution_scaling_factor=None if resolution_scaling_factor is None else self.resolution_scaling_factor[i],
+                    # Per-layer scaling for super-resolution, or None if disabled
+                    resolution_scaling_factor=(
+                        self.resolution_scaling_factor[i]
+                        if resolution_scaling_factor is not None
+                        else None
+                    ),
                     max_n_modes=max_n_modes,
                     rank=rank,
                     fixed_rank_modes=fixed_rank_modes,
@@ -271,6 +289,12 @@ class LocalNOBlocks(nn.Module):
                     separable=separable,
                     factorization=factorization,
                     decomposition_kwargs=decomposition_kwargs,
+                    # Only SpectralConv (and subclasses) accept enforce_hermitian_symmetry. Others ignore it
+                    **(
+                        {"enforce_hermitian_symmetry": enforce_hermitian_symmetry}
+                        if issubclass(conv_module, SpectralConv)
+                        else {}
+                    ),
                 )
                 for i in range(n_layers)
             ]
@@ -388,7 +412,7 @@ class LocalNOBlocks(nn.Module):
         elif norm == "group_norm":
             self.norm = nn.ModuleList(
                 [
-                    nn.GroupNorm(num_groups=1, num_channels=self.out_channels)
+                    nn.GroupNorm(num_groups=norm_groups, num_channels=self.out_channels)
                     for _ in range(n_layers * self.n_norms)
                 ]
             )

@@ -29,7 +29,7 @@ class LocalNO(BaseModel, name="LocalNO"):
     Fourier layers as detailed in [1]_.
 
     Parameters
-    ---------------
+    ----------
     n_modes : Tuple[int]
         Number of modes to keep in Fourier Layer, along each dimension.
         The dimensionality of the Local NO is inferred from len(n_modes).
@@ -96,6 +96,8 @@ class LocalNO(BaseModel, name="LocalNO"):
         Non-linear activation function module to use. Default: F.gelu
     norm : str, optional
         Normalization layer to use. Options: "ada_in", "group_norm", "instance_norm", None. Default: None
+    norm_groups : int, optional
+        Number of groups for GroupNorm, by default 1
     complex_data : bool, optional
         Whether data is complex-valued. If True, initializes complex-valued modules. Default: False
     use_channel_mlp : bool, optional
@@ -153,9 +155,16 @@ class LocalNO(BaseModel, name="LocalNO"):
         Whether to compute LocalNO forward pass with ResNet-style preactivation. Default: False
     conv_module : nn.Module, optional
         Module to use for LocalNOBlock's convolutions. Default: SpectralConv
+    enforce_hermitian_symmetry : bool, optional
+        Whether to enforce Hermitian symmetry conditions when performing inverse FFT
+        for real-valued data. Only used when ``conv_module`` is :class:`SpectralConv`
+        or a subclass; ignored otherwise. When True, explicitly enforces that the 0th
+        frequency and Nyquist frequency are real-valued before calling irfft. When False,
+        relies on cuFFT's irfftn to handle symmetry automatically, which may fail on
+        certain GPUs or input sizes, causing line artifacts. By default True.
 
     Examples
-    ---------
+    --------
 
     >>> from neuralop.models import LocalNO
     >>> model = LocalNO(n_modes=(12,12), in_channels=1, out_channels=1, hidden_channels=64)
@@ -171,7 +180,7 @@ class LocalNO(BaseModel, name="LocalNO"):
             ... torch.nn.Module printout truncated ...
 
     References
-    -----------
+    ----------
     .. [1] Liu-Schiaffini M., Berner J., Bonev B., Kurth T., Azizzadenesheli K., Anandkumar A.;
         "Neural Operators with Localized Integral and Differential Kernels" (2024).
         ICML 2024, https://arxiv.org/pdf/2402.16845.
@@ -201,6 +210,7 @@ class LocalNO(BaseModel, name="LocalNO"):
         positional_embedding: Union[str, nn.Module] = "grid",
         non_linearity: nn.Module = F.gelu,
         norm: str = None,
+        norm_groups: int = 1,
         complex_data: bool = False,
         use_channel_mlp: bool = False,
         channel_mlp_dropout: float = 0,
@@ -220,6 +230,7 @@ class LocalNO(BaseModel, name="LocalNO"):
         separable: bool = False,
         preactivation: bool = False,
         conv_module: nn.Module = SpectralConv,
+        enforce_hermitian_symmetry: bool = True,
     ):
         super().__init__()
         self.n_dim = len(n_modes)
@@ -315,6 +326,7 @@ class LocalNO(BaseModel, name="LocalNO"):
             non_linearity=non_linearity,
             stabilizer=stabilizer,
             norm=norm,
+            norm_groups=norm_groups,
             preactivation=preactivation,
             local_no_skip=local_no_skip,
             channel_mlp_skip=channel_mlp_skip,
@@ -328,6 +340,7 @@ class LocalNO(BaseModel, name="LocalNO"):
             decomposition_kwargs=decomposition_kwargs,
             conv_module=conv_module,
             n_layers=n_layers,
+            enforce_hermitian_symmetry=enforce_hermitian_symmetry,
         )
 
         # if adding a positional embedding, add those channels to lifting

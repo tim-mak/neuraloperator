@@ -39,14 +39,15 @@ class RNO(BaseModel, name="RNO"):
     where * is element-wise, the b_i's are bias functions, and W_i, U_i are
     linear Fourier layers.
 
-    Paper:
+    References
+    ----------
     .. [RNO] Liu-Schiaffini, M., Singer, C. E., Kovachki, N., Schneider, T.,
         Azizzadenesheli, K., & Anandkumar, A. (2023). Tipping point forecasting
         in non-stationary dynamics on function spaces. arXiv preprint
         arXiv:2308.08794.
 
-    Main Parameters
-    ---------------
+    Parameters
+    ----------
     n_modes : Tuple[int, ...]
         Number of modes to keep in Fourier Layer, along each dimension.
         The dimensionality of the RNO is inferred from ``len(n_modes)``.
@@ -71,8 +72,8 @@ class RNO(BaseModel, name="RNO"):
         RNO's recurrent structure already provides temporal gradient pathways,
         so skip connections are optional and may not always improve performance.
 
-    Other parameters
-    ---------------
+    Other Parameters
+    ----------------
     lifting_channel_ratio : Number, optional
         Ratio of lifting channels to hidden_channels.
         The number of lifting channels in the lifting block of the RNO is
@@ -92,6 +93,8 @@ class RNO(BaseModel, name="RNO"):
         Non-Linear activation function module to use. Default: F.gelu
     norm : Literal["ada_in", "group_norm", "instance_norm"], optional
         Normalization layer to use. Options: "ada_in", "group_norm", "instance_norm", None. Default: None
+    norm_groups : int, optional
+        Number of groups for GroupNorm, by default 1
     complex_data : bool, optional
         Whether the data is complex-valued. If True, initializes complex-valued modules. Default: False
     use_channel_mlp : bool, optional
@@ -155,6 +158,13 @@ class RNO(BaseModel, name="RNO"):
         Whether to compute FNO forward pass with resnet-style preactivation. Default: False
     conv_module : nn.Module, optional
         Module to use for FNOBlock's convolutions. Default: SpectralConv
+    enforce_hermitian_symmetry : bool, optional
+        Whether to enforce Hermitian symmetry conditions when performing inverse FFT
+        for real-valued data. Only used in :class:`SpectralConv`; ignored otherwise.
+        When True, explicitly enforces that the 0th frequency and Nyquist frequency
+        are real-valued before calling irfft. When False, relies on cuFFT's irfftn
+        to handle symmetry automatically, which may fail on certain GPUs or input
+        sizes, causing line artifacts. By default True.
     """
 
     def __init__(
@@ -170,6 +180,7 @@ class RNO(BaseModel, name="RNO"):
         positional_embedding: Union[str, nn.Module] = "grid",
         non_linearity: nn.Module = F.gelu,
         norm: Literal["ada_in", "group_norm", "instance_norm"] = None,
+        norm_groups: int = 1,
         complex_data: bool = False,
         use_channel_mlp: bool = True,
         channel_mlp_dropout: float = 0,
@@ -190,6 +201,7 @@ class RNO(BaseModel, name="RNO"):
         separable: bool = False,
         preactivation: bool = False,
         conv_module: nn.Module = SpectralConv,
+        enforce_hermitian_symmetry: bool = True,
     ):
         if decomposition_kwargs is None:
             decomposition_kwargs = {}
@@ -288,6 +300,7 @@ class RNO(BaseModel, name="RNO"):
                 non_linearity=non_linearity,
                 stabilizer=stabilizer,
                 norm=norm,
+                norm_groups=norm_groups,
                 preactivation=preactivation,
                 fno_skip=fno_skip,
                 channel_mlp_skip=channel_mlp_skip,
@@ -301,6 +314,7 @@ class RNO(BaseModel, name="RNO"):
                 factorization=factorization,
                 decomposition_kwargs=decomposition_kwargs,
                 conv_module=conv_module,
+                enforce_hermitian_symmetry=enforce_hermitian_symmetry,
             )
             for i in range(n_layers)
         ]

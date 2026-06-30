@@ -16,6 +16,7 @@ tenalg.set_backend("einsum")
 @pytest.mark.parametrize("lifting_channel_ratio", [1, 2])
 @pytest.mark.parametrize("preactivation", [False, True])
 @pytest.mark.parametrize("complex_data", [True, False])
+@pytest.mark.parametrize("enforce_hermitian_symmetry", [True, False])
 def test_fno(
     n_dim,
     fno_block_precision,
@@ -23,20 +24,21 @@ def test_fno(
     lifting_channel_ratio,
     preactivation,
     complex_data,
+    enforce_hermitian_symmetry,
 ):
     if torch.has_cuda:
         device = "cuda"
-        s = 16
+        s = 12
         modes = 8
-        width = 16
+        width = 12
         batch_size = 4
         n_layers = 4
     else:
         device = "cpu"
         fno_block_precision = "full"
-        s = 16
+        s = 12
         modes = 5
-        width = 15
+        width = 9
         batch_size = 3
         n_layers = 2
 
@@ -57,6 +59,7 @@ def test_fno(
         preactivation=preactivation,
         complex_data=complex_data,
         fno_block_precision=fno_block_precision,
+        enforce_hermitian_symmetry=enforce_hermitian_symmetry,
     ).to(device)
 
     in_data = torch.randn(batch_size, 3, *size, dtype=dtype).to(device)
@@ -92,10 +95,10 @@ def test_fno(
     ],
 )
 def test_fno_superresolution(resolution_scaling_factor):
-    device = "cpu"
-    s = 16
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    s = 12
     modes = 5
-    hidden_channels = 15
+    hidden_channels = 9
     batch_size = 3
     n_layers = 3
     n_dim = 2
@@ -134,10 +137,10 @@ def test_fno_superresolution(resolution_scaling_factor):
 @pytest.mark.parametrize("complex_data", [True, False])
 def test_fno_advanced_params(norm, use_channel_mlp, channel_mlp_skip, fno_skip, complex_data):
     """Test FNO with various advanced parameter combinations."""
-    device = "cpu"
-    s = 16
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    s = 12
     modes = 5
-    hidden_channels = 15
+    hidden_channels = 9
     batch_size = 3
     n_layers = 2
     n_dim = 2
@@ -175,14 +178,50 @@ def test_fno_advanced_params(norm, use_channel_mlp, channel_mlp_skip, fno_skip, 
     loss.backward()
 
 
+def test_fno_group_norm():
+    """Test FNO with group_norm and custom norm_groups"""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    modes = 5
+    hidden_channels = 16
+    batch_size = 2
+    n_layers = 2
+    n_dim = 2
+    size = (12,) * n_dim
+    n_modes = (modes,) * n_dim
+    norm_groups = 4
+
+    model = FNO(
+        in_channels=3,
+        out_channels=1,
+        n_modes=n_modes,
+        hidden_channels=hidden_channels,
+        n_layers=n_layers,
+        norm="group_norm",
+        norm_groups=norm_groups,
+    ).to(device)
+
+    in_data = torch.randn(batch_size, 3, *size).to(device)
+
+    # Test forward pass
+    out = model(in_data)
+
+    # Check output size
+    assert list(out.shape) == [batch_size, 1, *size]
+
+    # Verify norm_groups propagation
+    for norm_layer in model.fno_blocks.norm:
+        assert isinstance(norm_layer, torch.nn.GroupNorm)
+        assert norm_layer.num_groups == norm_groups
+
+
 @pytest.mark.parametrize("positional_embedding", ["grid", None])
 @pytest.mark.parametrize("domain_padding", [None, 0.1, [0.1, 0.2]])
 def test_fno_embedding_and_padding(positional_embedding, domain_padding):
     """Test FNO with different positional embeddings and domain padding."""
-    device = "cpu"
-    s = 16
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    s = 12
     modes = 5
-    hidden_channels = 15
+    hidden_channels = 9
     projection_channel_ratio = 2
     lifting_channel_ratio = 2
     batch_size = 3
@@ -217,10 +256,10 @@ def test_fno_embedding_and_padding(positional_embedding, domain_padding):
 @pytest.mark.parametrize("non_linearity", [F.gelu, F.relu, F.tanh])
 def test_fno_channel_mlp_params(channel_mlp_dropout, channel_mlp_expansion, non_linearity):
     """Test FNO with different channel MLP parameters."""
-    device = "cpu"
-    s = 16
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    s = 12
     modes = 5
-    hidden_channels = 15
+    hidden_channels = 9
     batch_size = 3
     n_layers = 2
     n_dim = 2
@@ -245,3 +284,35 @@ def test_fno_channel_mlp_params(channel_mlp_dropout, channel_mlp_expansion, non_
 
     # Check output size
     assert list(out.shape) == [batch_size, 1, *size]
+
+
+def test_fno_conv_bias_kernel():
+    """Test FNO with a local convolutional bias kernel."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    s = 12
+    modes = 5
+    hidden_channels = 9
+    batch_size = 3
+    n_layers = 2
+    n_dim = 2
+    size = (s,) * n_dim
+    n_modes = (modes,) * n_dim
+    conv_bias_kernel = 3
+
+    model = FNO(
+        in_channels=3,
+        out_channels=1,
+        n_modes=n_modes,
+        hidden_channels=hidden_channels,
+        n_layers=n_layers,
+        conv_bias_kernel=conv_bias_kernel,
+    ).to(device)
+
+    in_data = torch.randn(batch_size, 3, *size).to(device)
+    out = model(in_data)
+
+    assert list(out.shape) == [batch_size, 1, *size]
+    assert model.conv_bias_kernel == conv_bias_kernel
+    assert model.fno_blocks.conv_bias_kernel == conv_bias_kernel
+
+    out.sum().backward()

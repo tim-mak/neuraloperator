@@ -119,6 +119,8 @@ class GINO(BaseModel):
         By default None, otherwise tanh is used before FFT in the FNO block. Default: None
     fno_norm : str, optional
         Normalization layer to use in FNO. Options: "ada_in", "group_norm", "instance_norm", None. Default: None
+    fno_norm_groups : int, optional
+        Number of groups for GroupNorm in FNO, by default 1
     fno_ada_in_features : int, optional
         If an adaptive mesh is used, number of channels of its positional embedding.
         If None, adaptive mesh embedding is not used. Default: 4
@@ -149,10 +151,16 @@ class GINO(BaseModel):
         Additional parameters to pass to the tensor decomposition. Default: {}
     fno_conv_module : nn.Module, optional
         Spectral convolution module to use. Default: SpectralConv
-
+    fno_enforce_hermitian_symmetry : bool, optional
+        Whether to enforce Hermitian symmetry conditions when performing inverse FFT
+        for real-valued data in the FNO branch. Only used in :class:`SpectralConv`;
+        ignored otherwise. When True, explicitly enforces that the 0th frequency and
+        Nyquist frequency are real-valued before calling irfft. When False, relies on
+        cuFFT's irfftn to handle symmetry automatically, which may fail on certain
+        GPUs or input sizes, causing line artifacts. By default True.
 
     References
-    -----------
+    ----------
     .. [1] : Li, Z., Kovachki, N., Choy, C., Li, B., Kossaifi, J., Otta, S.,
         Nabian, M., Stadler, M., Hundt, C., Azizzadenesheli, K., Anandkumar, A. (2023)
         Geometry-Informed Neural Operator for Large-Scale 3D PDEs. NeurIPS 2023,
@@ -198,6 +206,7 @@ class GINO(BaseModel):
         fno_non_linearity=F.gelu,
         fno_stabilizer=None,
         fno_norm=None,
+        fno_norm_groups=1,
         fno_ada_in_features=4,
         fno_ada_in_dim=1,
         fno_preactivation=False,
@@ -210,6 +219,7 @@ class GINO(BaseModel):
         fno_implementation="factorized",
         fno_decomposition_kwargs=dict(),
         fno_conv_module=SpectralConv,
+        fno_enforce_hermitian_symmetry=True,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -324,6 +334,7 @@ class GINO(BaseModel):
             non_linearity=fno_non_linearity,
             stabilizer=fno_stabilizer,
             norm=fno_norm,
+            norm_groups=fno_norm_groups,
             ada_in_features=self.ada_in_dim,
             preactivation=fno_preactivation,
             fno_skip=fno_skip,
@@ -335,6 +346,7 @@ class GINO(BaseModel):
             implementation=fno_implementation,
             decomposition_kwargs=fno_decomposition_kwargs,
             conv_module=fno_conv_module,
+            enforce_hermitian_symmetry=fno_enforce_hermitian_symmetry,
         )
 
         ### output GNO

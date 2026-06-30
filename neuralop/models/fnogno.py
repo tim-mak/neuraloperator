@@ -100,6 +100,8 @@ class FNOGNO(BaseModel, name="FNOGNO"):
         By default None, otherwise tanh is used before FFT in the FNO block. Default: None
     fno_norm : str, optional
         Normalization layer to use in FNO. Options: "ada_in", "group_norm", "instance_norm", None. Default: None
+    fno_norm_groups : int, optional
+        Number of groups for GroupNorm in FNO, by default 1
     fno_ada_in_features : int, optional
         If an adaptive mesh is used, number of channels of its positional embedding. Default: None
     fno_ada_in_dim : int, optional
@@ -138,6 +140,13 @@ class FNOGNO(BaseModel, name="FNOGNO"):
         Additional parameters to pass to the tensor decomposition. Default: {}
     fno_conv_module : nn.Module, optional
         Spectral convolution module to use. Default: SpectralConv
+    fno_enforce_hermitian_symmetry : bool, optional
+        Whether to enforce Hermitian symmetry conditions when performing inverse FFT
+        for real-valued data in the FNO branch. Only used in :class:`SpectralConv`;
+        ignored otherwise. When True, explicitly enforces that the 0th frequency and
+        Nyquist frequency are real-valued before calling irfft. When False, relies on
+        cuFFT's irfftn to handle symmetry automatically, which may fail on certain
+        GPUs or input sizes, causing line artifacts. By default True.
     """
 
     def __init__(
@@ -172,6 +181,7 @@ class FNOGNO(BaseModel, name="FNOGNO"):
         fno_non_linearity=F.gelu,
         fno_stabilizer=None,
         fno_norm=None,
+        fno_norm_groups=1,
         fno_ada_in_features=None,
         fno_ada_in_dim=1,
         fno_preactivation=False,
@@ -184,6 +194,7 @@ class FNOGNO(BaseModel, name="FNOGNO"):
         fno_implementation="factorized",
         fno_decomposition_kwargs=dict(),
         fno_conv_module=SpectralConv,
+        fno_enforce_hermitian_symmetry=True,
     ):
         super().__init__()
 
@@ -261,6 +272,7 @@ class FNOGNO(BaseModel, name="FNOGNO"):
             non_linearity=fno_non_linearity,
             stabilizer=fno_stabilizer,
             norm=fno_norm,
+            norm_groups=fno_norm_groups,
             ada_in_features=self.ada_in_dim,
             preactivation=fno_preactivation,
             fno_skip=fno_skip,
@@ -272,6 +284,7 @@ class FNOGNO(BaseModel, name="FNOGNO"):
             implementation=fno_implementation,
             decomposition_kwargs=fno_decomposition_kwargs,
             conv_module=fno_conv_module,
+            enforce_hermitian_symmetry=fno_enforce_hermitian_symmetry,
         )
 
         self.gno_radius = gno_radius
